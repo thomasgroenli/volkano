@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "volkano"
+version = "0.0.1"
+description = "Pure-Python Vulkan driver interface — ctypes-based, lazy registry-driven, zero compiled code in the wheel"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Thomas Grønli", email = "thomas.gronli@gmail.com" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries",
+]
+
+[tool.setuptools.packages.find]
+include = ["volkano*"]
+exclude = ["tests*"]
+
