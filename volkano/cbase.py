@@ -12,7 +12,7 @@ from typing import Generic, TypeVar
 
 # Type parameters for :class:`Pointer` and :class:`Array`. Declared so
 # ``Pointer[X]`` / ``Array[X]`` are valid generic aliases for static
-# analysers (notably inside the generated ``vk.pyi`` stub, where pyright
+# analysers (notably inside the generated ``__init__.pyi`` stub, where pyright
 # enforces strict type-expression rules and would otherwise reject the
 # subscript). At runtime the custom ``__class_getitem__`` on each class
 # still governs and returns the concrete subclass — the ``Generic`` base

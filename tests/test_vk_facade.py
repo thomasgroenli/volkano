@@ -1,10 +1,10 @@
-"""Tests for the volkano.vk module facade."""
+"""Tests for the volkano package facade."""
 from __future__ import annotations
 
 import unittest
 from unittest.mock import patch
 
-from volkano import vk
+import volkano as vk
 
 
 class _FakeReg:
@@ -19,7 +19,7 @@ def _patch_build(factory):
 
 
 class FacadeTests(unittest.TestCase):
-    """vk.py keeps a module-global registry; reset around every test."""
+    """The package keeps a module-global registry; reset around every test."""
 
     def setUp(self):
         vk._registry = None

@@ -1,8 +1,8 @@
-"""Generate a ``.pyi`` stub file for :mod:`volkano.vk`.
+"""Generate a ``.pyi`` stub file for the :mod:`volkano` package.
 
-The runtime module resolves all 8 000+ Vulkan symbols dynamically via
+The runtime package resolves all 8 000+ Vulkan symbols dynamically via
 PEP 562 :func:`__getattr__`. That works at runtime but is invisible to
-static analysers — IDEs can't autocomplete ``vk.vk…`` because they
+static analysers — IDEs can't autocomplete ``volkano.vk…`` because they
 never see those names declared. This module walks the live registry
 (forcing every resolvable entry) and emits a stub file that declares
 each name with a permissive type, so type checkers and language
@@ -10,15 +10,16 @@ servers gain full coverage of the Vulkan API surface.
 
 Use as a CLI::
 
-    python -m volkano.stub                  # writes volkano/vk.pyi
+    python -m volkano.stub                  # writes volkano/__init__.pyi
     python -m volkano.stub -o other.pyi     # custom path
 
 Or programmatically::
 
     from volkano.stub import write_stub
-    write_stub('volkano/vk.pyi')
+    write_stub('volkano/__init__.pyi')
 
-The stub is purely a hint for tooling — `vk.py` itself works without it.
+The stub is purely a hint for tooling — the package itself works
+without it.
 """
 
 from __future__ import annotations
@@ -34,11 +35,11 @@ from . import cbase
 
 
 _HEADER = '''\
-# Auto-generated stub for volkano.vk — do not edit by hand.
+# Auto-generated stub for the volkano package — do not edit by hand.
 # Regenerate with: python -m volkano.stub
 #
 # Every name here is resolved dynamically at runtime via PEP 562
-# __getattr__ on the module; this file exists purely so static
+# __getattr__ on the package; this file exists purely so static
 # analysers can offer autocomplete and parameter hints.
 
 from typing import Any
@@ -54,7 +55,7 @@ from volkano.cbase import (
 )
 
 
-# Configuration helpers (real functions in volkano/vk.py).
+# Configuration helpers (real functions in volkano/__init__.py).
 def configure(*, source: Any = ..., library: Any = ..., refresh: bool = ...,
               reset: bool = ...) -> None: ...
 def get_registry() -> Any: ...
@@ -265,7 +266,7 @@ def _emit_scalar_or_funcpointer(out: IO[str], name: str) -> None:
     out.write(f'{name}: Any\n')
 
 
-def write_stub(path: str = 'volkano/vk.pyi') -> int:
+def write_stub(path: str = 'volkano/__init__.pyi') -> int:
     """Walk the registry singleton and write a ``.pyi`` stub at ``path``.
 
     Returns the number of declarations emitted. Forces every resolvable
@@ -273,7 +274,7 @@ def write_stub(path: str = 'volkano/vk.pyi') -> int:
     pay incrementally anyway, paid up front here so the stub captures
     the full surface.
     """
-    from .vk import get_registry
+    from . import get_registry
     registry = get_registry()
 
     # Bucket entries by kind so the stub groups related declarations
@@ -350,7 +351,7 @@ def write_stub(path: str = 'volkano/vk.pyi') -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('-o', '--output', default=None,
-                        help='Where to write the .pyi (default: alongside vk.py)')
+                        help='Where to write the .pyi (default: volkano/__init__.pyi)')
     parser.add_argument('-source', default=None,
                         help='Path or URL of vk.xml to use (default: cached GitHub copy)')
     args = parser.parse_args(argv)
@@ -358,12 +359,12 @@ def main(argv: list[str] | None = None) -> int:
     # If a source was given, configure the singleton before any
     # registry access — otherwise it gets the defaults.
     if args.source is not None:
-        from . import vk
-        vk.configure(source=args.source, library=None, reset=True)
+        from . import configure
+        configure(source=args.source, library=None, reset=True)
 
     if args.output is None:
         here = os.path.dirname(os.path.abspath(__file__))
-        args.output = os.path.join(here, 'vk.pyi')
+        args.output = os.path.join(here, '__init__.pyi')
 
     count = write_stub(args.output)
     print(f'wrote {count} declarations to {args.output}', file=sys.stderr)
