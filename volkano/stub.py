@@ -12,11 +12,24 @@ Use as a CLI::
 
     python -m volkano.stub                  # writes volkano/__init__.pyi
     python -m volkano.stub -o other.pyi     # custom path
+    python -m volkano.stub --refresh        # redownload main.xml first
 
 Or programmatically::
 
     from volkano.stub import write_stub
-    write_stub('volkano/__init__.pyi')
+    write_stub()
+
+The stub carries a provenance stamp on its first line naming the
+sha256 of the XML it was generated from. :func:`sync_stub` compares
+that against the registry it is handed and rewrites only on a
+mismatch, so the file tracks whichever ``vk.xml`` the package facade
+is actually built from. Stamping content rather than keying off "did
+we just download something" is what makes it self-healing: a deleted
+stub, a pre-populated cache and an interrupted write all repair
+themselves on the next import.
+
+Only the package facade (:func:`volkano.get_registry`) syncs the stub.
+A registry built through :func:`volkano.registry` never touches it.
 
 The stub is purely a hint for tooling — the package itself works
 without it.
@@ -27,11 +40,21 @@ from __future__ import annotations
 import argparse
 import ctypes
 import enum
+import itertools
+import logging
 import os
+import re
 import sys
+import tempfile
 from typing import Any, IO
 
 from . import cbase
+
+
+# Stub-side logger. Regeneration is an INFO lifecycle event; failures
+# are WARNINGs rather than exceptions, since a stale stub costs
+# autocomplete and never correctness.
+logger = logging.getLogger('volkano.stub')
 
 
 _HEADER = '''\
@@ -55,9 +78,8 @@ from volkano.cbase import (
 )
 
 
-# Configuration helpers (real functions in volkano/__init__.py).
-def configure(*, source: Any = ..., library: Any = ..., refresh: bool = ...,
-              reset: bool = ...) -> None: ...
+# Real functions in volkano/__init__.py.
+def registry(source: Any = ..., *, library: Any = ...) -> Any: ...
 def get_registry() -> Any: ...
 
 '''
@@ -266,16 +288,115 @@ def _emit_scalar_or_funcpointer(out: IO[str], name: str) -> None:
     out.write(f'{name}: Any\n')
 
 
-def write_stub(path: str = 'volkano/__init__.pyi') -> int:
-    """Walk the registry singleton and write a ``.pyi`` stub at ``path``.
+def default_stub_path() -> str:
+    """Path of the stub that ships beside this module (``volkano/__init__.pyi``)."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), '__init__.pyi')
+
+
+#: Bump whenever a change to this module or to the XML parser alters
+#: the *content* of a generated stub. The XML digest alone can't
+#: detect that: identical input plus improved code yields a different
+#: (and previously wrong) stub, which would otherwise never be
+#: rewritten — leaving the stub contradicting the runtime on specific
+#: values. Bumped to 2 when parse_int stopped eating hex digits.
+_GENERATOR = 2
+
+# The provenance stamp is written as its own first line rather than
+# folded into _HEADER, so the template stays free of format braces and
+# a reader only ever has to parse line 1.
+_STAMP_RE = re.compile(r'^#\s*volkano-stub:\s*sha256=([0-9a-f]{64})\s+'
+                       r'gen=(\d+)\s+'
+                       r'header-version=(\S+)\s+source=(.*)$')
+
+
+def _stamp_line(provenance: Any) -> str:
+    return (f'# volkano-stub: sha256={provenance.sha256} '
+            f'gen={_GENERATOR} '
+            f'header-version={provenance.header_version} '
+            f'source={provenance.label}\n')
+
+
+def _expected_stamp(provenance: Any) -> tuple[str, int, str]:
+    return (provenance.sha256, _GENERATOR, provenance.label)
+
+
+def read_stub_provenance(path: str) -> tuple[str, int, str] | None:
+    """Return ``(sha256, generator, source_label)`` from a stub's stamp.
+
+    ``None`` if the file is absent, unreadable, or predates the current
+    stamp format — all of which mean "regenerate", so the caller needs
+    no special case for any of them.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            # The stamp is line 1; scan a few more purely so a stray
+            # leading blank line or editor artefact doesn't defeat it.
+            for line in itertools.islice(f, 8):
+                match = _STAMP_RE.match(line.strip())
+                if match:
+                    return match.group(1), int(match.group(2)), match.group(4)
+    except OSError:
+        return None
+    return None
+
+
+def sync_stub(registry: Any, *, path: str | None = None) -> bool:
+    """Regenerate ``path`` if its stamp disagrees with ``registry``.
+
+    Returns ``True`` if the stub was written. Never raises: a stale stub
+    costs autocomplete, not correctness, and an installed package can
+    sit on a read-only prefix — neither should sink an otherwise-good
+    build.
+
+    A registry with no provenance (one built from an
+    :class:`~xml.etree.ElementTree.Element`, which has no identity to
+    record) is never written. That absence is what keeps test fixtures
+    from clobbering the real stub, without needing a flag to say so.
+    """
+    provenance = getattr(registry, '_provenance', None)
+    if provenance is None:
+        return False
+    path = path or default_stub_path()
+    if read_stub_provenance(path) == _expected_stamp(provenance):
+        return False
+    # Log before, not after: this forces every key in the registry and
+    # is the multi-second pause a user notices on a cold install.
+    logger.info('regenerating %s from %s', path, provenance.label)
+    try:
+        count = write_stub(path, registry=registry, provenance=provenance)
+    except Exception as exc:
+        # Deliberately broad. os.replace onto a .pyi held open by a
+        # language server raises PermissionError on Windows, and an
+        # emitter bug shouldn't be fatal either.
+        logger.warning('could not regenerate %s: %s', path, exc)
+        return False
+    logger.info('regenerated %s: %d declarations', path, count)
+    return True
+
+
+def write_stub(path: str | None = None, *, registry: Any = None,
+               provenance: Any = None) -> int:
+    """Walk a registry and write a ``.pyi`` stub at ``path``.
 
     Returns the number of declarations emitted. Forces every resolvable
     entry as a side effect — that's the warm-up cost the runtime would
     pay incrementally anyway, paid up front here so the stub captures
     the full surface.
+
+    ``path`` defaults to :func:`default_stub_path`. ``registry``
+    defaults to the package singleton. ``provenance``, when given, is
+    stamped onto the first line for :func:`sync_stub` to compare
+    against later.
+
+    The write is atomic — a temp file in the target directory followed
+    by :func:`os.replace` — so a crash mid-emit can't leave a truncated
+    1.5 MB stub for an IDE to choke on.
     """
-    from . import get_registry
-    registry = get_registry()
+    if path is None:
+        path = default_stub_path()
+    if registry is None:
+        from . import get_registry
+        registry = get_registry()
 
     # Bucket entries by kind so the stub groups related declarations
     # together — much easier to skim by hand than alphabetical order.
@@ -296,78 +417,106 @@ def write_stub(path: str = 'volkano/__init__.pyi') -> int:
         kind = _classify(value)
         buckets.setdefault(kind, []).append((key, value))
 
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write(_HEADER)
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix='.__init__.pyi.',
+                               suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+            if provenance is not None:
+                f.write(_stamp_line(provenance))
+            f.write(_HEADER)
 
-        # Order matters here for human readability — types first, then
-        # constants that often reference them, then commands at the end.
-        if buckets['handle']:
-            f.write('\n# --- Handles ---\n')
-            for name, value in buckets['handle']:
-                _emit_handle(f, name, value)
+            # Order matters here for human readability — types first,
+            # then constants that often reference them, then commands.
+            if buckets['handle']:
+                f.write('\n# --- Handles ---\n')
+                for name, value in buckets['handle']:
+                    _emit_handle(f, name, value)
 
-        if buckets['enum']:
-            f.write('\n# --- Enums ---\n')
-            for name, value in buckets['enum']:
-                _emit_enum(f, name, value)
-                f.write('\n')
+            if buckets['enum']:
+                f.write('\n# --- Enums ---\n')
+                for name, value in buckets['enum']:
+                    _emit_enum(f, name, value)
+                    f.write('\n')
 
-        if buckets['struct'] or buckets['union']:
-            f.write('\n# --- Structs / unions ---\n')
-            for name, value in buckets['struct']:
-                _emit_struct_like(f, name, value, 'struct')
-                f.write('\n')
-            for name, value in buckets['union']:
-                _emit_struct_like(f, name, value, 'union')
-                f.write('\n')
+            if buckets['struct'] or buckets['union']:
+                f.write('\n# --- Structs / unions ---\n')
+                for name, value in buckets['struct']:
+                    _emit_struct_like(f, name, value, 'struct')
+                    f.write('\n')
+                for name, value in buckets['union']:
+                    _emit_struct_like(f, name, value, 'union')
+                    f.write('\n')
 
-        if buckets['scalar'] or buckets['funcpointer']:
-            f.write('\n# --- Type aliases (primitives, bitmask typedefs, function pointers) ---\n')
-            for name, _ in buckets['scalar']:
-                _emit_scalar_or_funcpointer(f, name)
-            for name, _ in buckets['funcpointer']:
-                _emit_scalar_or_funcpointer(f, name)
+            if buckets['scalar'] or buckets['funcpointer']:
+                f.write('\n# --- Type aliases (primitives, bitmask typedefs, function pointers) ---\n')
+                for name, _ in buckets['scalar']:
+                    _emit_scalar_or_funcpointer(f, name)
+                for name, _ in buckets['funcpointer']:
+                    _emit_scalar_or_funcpointer(f, name)
 
-        for const_kind in ('int', 'float', 'str', 'bool', 'none'):
-            if buckets[const_kind]:
-                f.write(f'\n# --- {const_kind.capitalize()} constants ---\n')
-                for name, value in buckets[const_kind]:
-                    _emit_constant(f, name, value, const_kind)
+            for const_kind in ('int', 'float', 'str', 'bool', 'none'):
+                if buckets[const_kind]:
+                    f.write(f'\n# --- {const_kind.capitalize()} constants ---\n')
+                    for name, value in buckets[const_kind]:
+                        _emit_constant(f, name, value, const_kind)
 
-        if buckets['command']:
-            f.write('\n# --- Commands ---\n')
-            for name, value in buckets['command']:
-                _emit_command(f, name, value)
+            if buckets['command']:
+                f.write('\n# --- Commands ---\n')
+                for name, value in buckets['command']:
+                    _emit_command(f, name, value)
 
-        if skipped:
-            f.write('\n# --- Unresolved (registry forced raised; emitted as Any) ---\n')
-            for name in skipped:
-                f.write(f'{name}: Any\n')
+            if skipped:
+                f.write('\n# --- Unresolved (registry forced raised; emitted as Any) ---\n')
+                for name in skipped:
+                    f.write(f'{name}: Any\n')
+        os.replace(tmp, path)
+    except BaseException:
+        # Leave the previous stub intact; a half-written one is worse
+        # than a stale one.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
     total = sum(len(v) for v in buckets.values()) + len(skipped)
     return total
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Maintenance CLI: refresh the cached XML and/or rewrite the stub.
+
+    This is the only supported way to move a cached ``main.xml``
+    forward. Nothing revalidates during a normal import, so without an
+    explicit ``--refresh`` the cache is authoritative indefinitely.
+    """
+    from . import registry as build_registry
+    from .xml_source import ENV_VAR, refresh_source, resolve_source
+
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('-o', '--output', default=None,
-                        help='Where to write the .pyi (default: volkano/__init__.pyi)')
-    parser.add_argument('-source', default=None,
-                        help='Path or URL of vk.xml to use (default: cached GitHub copy)')
+                        help='where to write the .pyi (default: volkano/__init__.pyi)')
+    parser.add_argument('--source', default=None,
+                        help="'main', 'tag:<name>', 'branch:<name>', or a "
+                             f"path to a local vk.xml (default: ${ENV_VAR}, "
+                             f"else main)")
+    parser.add_argument('--refresh', action='store_true',
+                        help='redownload the source before generating '
+                             '(no-op for a tag - those never move)')
     args = parser.parse_args(argv)
 
-    # If a source was given, configure the singleton before any
-    # registry access — otherwise it gets the defaults.
-    if args.source is not None:
-        from . import configure
-        configure(source=args.source, library=None, reset=True)
+    source = args.source if args.source is not None else os.environ.get(ENV_VAR)
+    if args.refresh:
+        src = resolve_source(source)
+        print(f'{src.label}: {refresh_source(src)}', file=sys.stderr)
 
-    if args.output is None:
-        here = os.path.dirname(os.path.abspath(__file__))
-        args.output = os.path.join(here, '__init__.pyi')
-
-    count = write_stub(args.output)
-    print(f'wrote {count} declarations to {args.output}', file=sys.stderr)
+    # Built through the public mode-2 entry point: no singleton, and
+    # library=None so generating a stub never needs a Vulkan driver.
+    reg = build_registry(source, library=None)
+    output = args.output or default_stub_path()
+    count = write_stub(output, registry=reg, provenance=reg._provenance)
+    print(f'wrote {count} declarations to {output}', file=sys.stderr)
     return 0
 
 

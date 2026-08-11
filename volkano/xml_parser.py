@@ -7,6 +7,13 @@ apart from the form builders — :func:`Force`, :func:`Call`, :func:`Quote`
 are re-exported from :mod:`volkano.lazy` and produce thunk
 objects rather than marker-prefixed lists.
 
+This module is the *schema* half. Everything about where the bytes come
+from — the source vocabulary, downloads, the on-disk cache, provenance
+— lives in :mod:`volkano.xml_source`, which knows Khronos's repository
+and nothing about Vulkan's schema. The split keeps this file testable
+against an in-memory Element with no notion of caching, and keeps that
+one testable with no notion of what a ``<type>`` means.
+
 The dict this module returns is *not* JSON-serialisable: its values are
 Python objects with embedded callables and sentinels. That's the
 trade-off for losing the DSL's bookkeeping overhead — the thunk graph
@@ -16,81 +23,18 @@ intermediate serialisation step.
 
 from __future__ import annotations
 
-import hashlib
 import logging
-import os
-import pathlib
 import re
-import sys
-import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any
 
 from .lazy import Force, Call, Quote
+from .xml_source import Provenance, expected_header_version, load_xml, resolve_source
 
 
-# Parser-side logger. Network fetches surface at INFO (so a single
-# ``logging.basicConfig(level=logging.INFO)`` shows them); cached-file
-# usage drops to DEBUG so the steady-state case stays quiet.
+# Parser-side logger. One DEBUG record per resolved fragment; the
+# acquisition side logs separately under ``volkano.source``.
 logger = logging.getLogger('volkano.parser')
-
-
-# ---------------------------------------------------------------------------
-# Fetch + cache
-# ---------------------------------------------------------------------------
-
-#: Canonical location of the Vulkan-Docs registry. Pinned to the ``main``
-#: branch so :func:`parse_xml` always picks up the latest published API
-#: surface; pass ``source=`` explicitly to pin to a tag or commit.
-DEFAULT_VK_XML_URL = (
-    "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Docs/"
-    "refs/heads/main/xml/vk.xml"
-)
-
-
-def _user_cache_dir() -> pathlib.Path:
-    """Return a writable per-user cache directory for downloaded XML.
-
-    Honours XDG_CACHE_HOME on POSIX and LOCALAPPDATA on Windows. Shares
-    the cache filename with :mod:`lazyregistry.xml_parser` since both
-    packages consume the same XML — no point downloading twice.
-    """
-    if os.name == 'nt':
-        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~/AppData/Local')
-    else:
-        base = os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache')
-    path = pathlib.Path(base) / 'lazyregistry'
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _cache_path_for_url(url: str) -> pathlib.Path:
-    if url == DEFAULT_VK_XML_URL:
-        return _user_cache_dir() / 'vk.xml'
-    digest = hashlib.sha1(url.encode('utf-8')).hexdigest()[:8]
-    return _user_cache_dir() / f'vk-{digest}.xml'
-
-
-def fetch_xml(url: str = DEFAULT_VK_XML_URL, *, refresh: bool = False,
-              cache_path: pathlib.Path | str | None = None) -> pathlib.Path:
-    """Download ``url`` to the local cache (unless already present).
-
-    Returns the path to the cached file. Set ``refresh=True`` to force a
-    redownload; pass ``cache_path`` to override the default location.
-    """
-    target = pathlib.Path(cache_path) if cache_path is not None else _cache_path_for_url(url)
-    if target.exists() and not refresh:
-        logger.debug('using cached %s', target)
-        return target
-    target.parent.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(
-        url, headers={'User-Agent': 'volkano/0.1 (+https://github.com/KhronosGroup/Vulkan-Docs)'})
-    logger.info('fetching %s -> %s', url, target)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = resp.read()
-    target.write_bytes(data)
-    logger.info('cached %d bytes', len(data))
-    return target
 
 
 # ---------------------------------------------------------------------------
@@ -176,12 +120,80 @@ EXT_BASE = 1_000_000_000
 EXT_BLOCK = 1_000
 
 
+#: A C integer literal plus its suffix. The suffix set is **only**
+#: ``[uUlL]`` — ``f``/``F`` is a *float* suffix in C and, crucially, a
+#: hex digit. Stripping it blindly turns ``0x1F`` into ``0x1`` and
+#: ``0x7FFFFFFF`` into ``0x7``: silently wrong values, not errors.
+_C_INT_RE = re.compile(
+    r'''^(?P<body> [+-]?0[xX][0-9a-fA-F]+     # hex
+                 | [+-]?0[bB][01]+            # binary
+                 | [+-]?\d+                   # decimal / octal
+        )
+        (?P<suffix>[uUlL]*)$''', re.VERBOSE)
+
+
 def parse_int(s: str) -> int:
-    """``int(s, 0)`` tolerating C suffixes ``U`` / ``ULL`` / ``L`` / ``F``."""
-    s = s.strip().rstrip('uUlLfF')
-    if s.startswith('(') and s.endswith(')'):
-        s = s[1:-1]
-    return int(s, 0)
+    """``int(s, 0)`` tolerating C integer suffixes (``U`` / ``UL`` / ``ULL``)."""
+    s = s.strip()
+    while s.startswith('(') and s.endswith(')'):
+        s = s[1:-1].strip()
+    match = _C_INT_RE.match(s)
+    if match:
+        return int(match.group('body'), 0)
+    # Not a well-formed C integer literal. Fall back to the permissive
+    # reading so genuinely odd input still gets a shot, and let int()
+    # produce the error message if it can't.
+    return int(s.rstrip('uUlLfF'), 0)
+
+
+#: One term of a small C integer expression: an optional leading
+#: ``+``/``-``, an optional bitwise ``~``, then a literal with its
+#: suffix. Chained with :func:`_fold_int_expr` to cover the ``(~0U-1)``
+#: idiom that vk.xml used for sentinel constants up to ~v1.2.131.
+_INT_TERM_RE = re.compile(
+    r'\s*(?P<op>[-+])?\s*(?P<invert>~)?\s*'
+    r'(?P<num>0[xX][0-9a-fA-F]+|0[bB][01]+|\d+)[uUlL]*\s*')
+
+_IDENTIFIER_RE = re.compile(r'^[A-Za-z_]\w*$')
+
+
+def _fold_int_expr(text: str) -> int | None:
+    """Fold a small C integer expression such as ``(~0U-1)``.
+
+    Deliberately hand-rolled rather than handed to :func:`eval`: the
+    input is third-party XML, and the grammar we actually need is a
+    chain of ``+``/``-`` terms with an optional bitwise ``~``. Anything
+    outside that shape returns ``None`` so the caller can fall through
+    instead of guessing.
+
+    Note the result is Python-signed — ``~0U`` is ``-1``, not
+    ``0xFFFFFFFF``, matching how this parser has always read ``~0U``.
+    ctypes narrows it correctly on the way into a ``uint32`` field.
+    """
+    s = text.strip()
+    while s.startswith('(') and s.endswith(')'):
+        s = s[1:-1].strip()
+    total: int | None = None
+    pos = 0
+    for match in _INT_TERM_RE.finditer(s):
+        if match.start() != pos:
+            return None                      # a gap we don't model
+        pos = match.end()
+        value = int(match.group('num'), 0)
+        if match.group('invert'):
+            value = ~value
+        op = match.group('op')
+        if total is None:
+            total = -value if op == '-' else value
+        elif op == '-':
+            total -= value
+        elif op == '+':
+            total += value
+        else:
+            return None                      # two terms, no operator
+    if total is None or pos != len(s):
+        return None
+    return total
 
 
 def enum_value(elem: ET.Element,
@@ -196,12 +208,24 @@ def enum_value(elem: ET.Element,
         try:
             return (parse_int(raw), None)
         except ValueError:
-            stripped = raw.strip('() ')
-            if stripped.startswith('~'):
-                return (~parse_int(stripped[1:]), None)
-            if raw.startswith('"') and raw.endswith('"'):
-                return (raw[1:-1], None)
-            raise
+            pass
+        if raw.startswith('"') and raw.endswith('"'):
+            return (raw[1:-1], None)
+        folded = _fold_int_expr(raw)
+        if folded is not None:
+            return (folded, None)
+        stripped = raw.strip('() ')
+        if _IDENTIFIER_RE.match(stripped):
+            # A bare name in `value`. Older vk.xml expressed an alias
+            # this way, before the `alias` attribute existed; video.xml
+            # points at a top-level define the same way. Both are
+            # deferred references, so hand it to the alias machinery
+            # rather than trying to resolve it during this phase — the
+            # target may not have been parsed yet.
+            return (None, stripped)
+        raise ValueError(
+            f"cannot interpret enum value {raw!r} for "
+            f"{elem.get('name', '<unnamed>')!r}")
     if 'bitpos' in elem.attrib:
         return (1 << int(elem.get('bitpos', '0'), 0), None)
     if 'offset' in elem.attrib:
@@ -439,7 +463,12 @@ class XmlReader:
                 if resolved is not None:
                     aliases.append([mname, resolved])
                 else:
-                    aliases.append([mname, malias])
+                    # Not another member of this group — so it names
+                    # something at registry level (a define, a constant
+                    # from another block). Defer it rather than emitting
+                    # the bare string, which would reach make_enum as a
+                    # value of the wrong type.
+                    aliases.append([mname, Force(malias)])
 
         return Call('make_enum',
                     [name, kind, bitwidth, values, aliases],
@@ -610,33 +639,41 @@ class XmlReader:
 # High-level entry point
 # ---------------------------------------------------------------------------
 
-def parse_xml(source: Any = None, *,
-              api: str = 'vulkan',
-              refresh: bool = False,
-              cache_path: pathlib.Path | str | None = None) -> dict[str, Any]:
-    """Convert a Vulkan XML registry to thunk-graph data.
+def parse_registry(source: Any = None, *,
+                   api: str = 'vulkan') -> tuple[dict[str, Any], Provenance | None]:
+    """Convert a Vulkan XML registry to thunk-graph data, with provenance.
 
-    ``source`` accepts the same shapes as :func:`lazyregistry.xml_parser.parse_xml`:
-    ``None`` (default — fetch from GitHub), a URL string, a filesystem
-    path, or an :class:`xml.etree.ElementTree.Element`.
+    ``source`` takes the vocabulary of
+    :func:`volkano.xml_source.resolve_source`, plus an
+    :class:`~xml.etree.ElementTree.Element` for in-memory use.
+    """
+    root, provenance = load_xml(source)
+    data = XmlReader(root, api=api).run()
+    if provenance is None:
+        return data, None
+    header_version = data.get('VK_HEADER_VERSION')
+    if api == 'vulkan':
+        # Cross-check the bytes against what the source's name claims.
+        # Only 'vulkan' — vulkansc carries an unrelated
+        # VK_HEADER_VERSION that would fire spuriously. What counts as a
+        # claim is xml_source's business; what VK_HEADER_VERSION means
+        # is ours.
+        src = resolve_source(source)
+        expected = expected_header_version(src)
+        if expected is not None and header_version != expected:
+            raise ValueError(
+                f"{src.path} claims to be {src.label} but declares "
+                f"VK_HEADER_VERSION {header_version!r}, not {expected}. "
+                f"Delete it and let volkano refetch.")
+    return data, provenance._replace(header_version=header_version)
+
+
+def parse_xml(source: Any = None, *, api: str = 'vulkan') -> dict[str, Any]:
+    """Convert a Vulkan XML registry to thunk-graph data.
 
     Returns a dict whose values are :class:`_Thunk` / :class:`_Raw`
     objects (or plain literals for constants). Hand it to
     :func:`volkano.vulkan_stdlib.build_registry` to wrap it in a
     :class:`Lazy` and merge in the stdlib factories.
     """
-    if isinstance(source, ET.Element):
-        root = source
-    else:
-        path: pathlib.Path
-        if source is None:
-            path = fetch_xml(DEFAULT_VK_XML_URL, refresh=refresh,
-                             cache_path=cache_path)
-        elif isinstance(source, str) and (source.startswith('http://')
-                                          or source.startswith('https://')):
-            path = fetch_xml(source, refresh=refresh, cache_path=cache_path)
-        else:
-            path = pathlib.Path(source)
-        root = ET.parse(str(path)).getroot()
-    reader = XmlReader(root, api=api)
-    return reader.run()
+    return parse_registry(source, api=api)[0]

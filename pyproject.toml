@@ -20,3 +20,11 @@ classifiers = [
 include = ["volkano*"]
 exclude = ["tests*"]
 
+# PEP 561 marker. Without it a type checker ignores __init__.pyi even
+# once it exists. The stub itself is generated on the user's machine
+# (on first import, or via `python -m volkano.stub`) rather than shipped,
+# because it describes whichever vk.xml that machine is actually built
+# against — so it is deliberately absent from the wheel.
+[tool.setuptools.package-data]
+volkano = ["py.typed"]
+

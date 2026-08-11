@@ -1,11 +1,15 @@
 """Tests for the thunk-graph kernel in volkano.lazy."""
 from __future__ import annotations
 
+import pathlib
+import threading
+import time
 import unittest
 
+from volkano import lazy
 from volkano.lazy import (
     Lazy, Force, Call, Quote, SELF,
-    _Thunk, _Raw, _Expr,
+    _Thunk, _Raw,
 )
 
 
@@ -121,33 +125,121 @@ class BuilderHelperTests(unittest.TestCase):
         self.assertIs(seen[0][0], inner)
 
 
-class ExprTests(unittest.TestCase):
-    """Python-eval expression nodes with the registry as locals."""
+class NoInterpreterTests(unittest.TestCase):
+    """The resolution path holds no expression form and no eval().
 
-    def test_literal_expression(self):
-        r = Lazy({'x': _Expr('42')})
-        self.assertEqual(r('x'), 42)
+    The kernel once carried one. The Vulkan parser never emitted a
+    single node of it, so it was pure attack surface: registry XML is
+    third-party input, and it should not be able to reach an
+    interpreter. Arithmetic vk.xml genuinely contains is folded by
+    hand in xml_parser instead.
+    """
 
-    def test_arithmetic_expression(self):
-        r = Lazy({'x': _Expr('(2 + 3) * 4')})
-        self.assertEqual(r('x'), 20)
+    def test_the_kernel_exposes_no_expression_node(self):
+        self.assertFalse([n for n in dir(lazy) if 'Expr' in n])
 
-    def test_resolves_identifiers_via_registry(self):
-        r = Lazy({'A': 10, 'B': 20, 'sum': _Expr('A + B')})
-        self.assertEqual(r('sum'), 30)
+    def test_no_eval_in_the_module(self):
+        source = pathlib.Path(lazy.__file__).read_text(encoding='utf-8')
+        self.assertNotIn('eval(', source)
 
-    def test_bitshift_and_or_with_precedence(self):
-        r = Lazy({'mask': _Expr('(1 << 5) | (1 << 3)')})
-        self.assertEqual(r('mask'), 0b101000)
+    def test_a_string_value_stays_a_string(self):
+        # Not parsed, not evaluated -- forced literals pass through.
+        r = Lazy({'x': '(2 + 3) * 4'})
+        self.assertEqual(r('x'), '(2 + 3) * 4')
 
-    def test_calls_callable_resolved_from_registry(self):
-        r = Lazy({'double': lambda x: x * 2, 'v': _Expr('double(7)')})
-        self.assertEqual(r('v'), 14)
 
-    def test_python_keywords_are_not_resolved(self):
-        # 'True' / 'and' should pass through to Python without registry lookup.
-        r = Lazy({'flag': _Expr('True and 1 or 0')})
-        self.assertEqual(r('flag'), 1)
+class ConcurrentForceTests(unittest.TestCase):
+    """Forcing is memoised *per registry*, not per thread.
+
+    Vulkan type identity depends on it: if two threads racing one key
+    each built a value, the loser's ctypes class would be a different
+    object with the same name, and a struct field typed by one would
+    reject an instance of the other.
+    """
+
+    THREADS = 16
+
+    def _race(self, registry, key):
+        """Force ``key`` from many threads at once; return their results.
+
+        Failures are collected rather than left to die in the worker, so
+        a thread that raises makes the test fail loudly. Without the
+        lock, latecomers observe another thread's ``_RESOLVING`` sentinel
+        and raise a spurious "cyclic key reference" — invisible here if
+        only the successes were counted.
+        """
+        results: list = []
+        errors: list = []
+        barrier = threading.Barrier(self.THREADS)
+
+        def run():
+            barrier.wait()
+            try:
+                results.append(registry(key))
+            except BaseException as exc:      # noqa: BLE001 - reported below
+                errors.append(exc)
+
+        workers = [threading.Thread(target=run) for _ in range(self.THREADS)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), self.THREADS)
+        return results
+
+    def test_racing_threads_share_one_value(self):
+        calls = []
+
+        def slow_factory():
+            # Guarantees an overlap window rather than relying on luck.
+            calls.append(1)
+            time.sleep(0.05)
+            return object()
+
+        registry = Lazy({'x': _Thunk(slow_factory)})
+        results = self._race(registry, 'x')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(set(map(id, results))), 1)
+
+    def test_racing_threads_see_a_nested_graph_consistently(self):
+        def slow(value):
+            time.sleep(0.02)
+            return [value]
+
+        registry = Lazy({
+            'leaf': _Thunk(lambda: object()),
+            'mid': _Thunk(slow, Force('leaf')),
+            'top': _Thunk(slow, Force('mid')),
+        })
+        results = self._race(registry, 'top')
+        self.assertEqual(len(set(map(id, results))), 1)
+
+    def test_a_real_cycle_still_raises_rather_than_deadlocking(self):
+        # The lock is re-entrant, so an owner re-entering its own frame
+        # reaches the _RESOLVING sentinel instead of blocking forever.
+        registry = Lazy({'a': Force('b'), 'b': Force('a')})
+        with self.assertRaises(ValueError):
+            registry('a')
+
+    def test_self_reference_raises(self):
+        registry = Lazy({'a': Force('a')})
+        with self.assertRaises(ValueError):
+            registry('a')
+
+    def test_a_failed_force_does_not_poison_the_cache(self):
+        attempts = {'n': 0}
+
+        def flaky():
+            attempts['n'] += 1
+            if attempts['n'] == 1:
+                raise RuntimeError('first attempt fails')
+            return 'ok'
+
+        registry = Lazy({'x': _Thunk(flaky)})
+        with self.assertRaises(RuntimeError):
+            registry('x')
+        self.assertEqual(registry('x'), 'ok')
 
 
 if __name__ == '__main__':

@@ -25,13 +25,21 @@ The :class:`Lazy` mapping memoises each key's resolved value on first
 force, raising :class:`ValueError` on cyclic resolution. Reading a raw
 form back without forcing is :meth:`Lazy.__getitem__`; forcing (with
 cache) is :meth:`Lazy.__call__`.
+
+There is deliberately no expression form and no :func:`eval` anywhere
+in the resolution path. The kernel once carried one, for arithmetic a
+source language might want deferred, but the Vulkan parser never
+emitted a single node of it: forcing every key across registries from
+2016 to today produced zero. Arithmetic that vk.xml *does* contain —
+``(~0U-1)`` sentinels, ``VK_MAKE_VERSION`` macros — is folded by hand
+in :mod:`volkano.xml_parser`, over a grammar small enough to read.
+Third-party XML should not reach an interpreter.
 """
 
 from __future__ import annotations
 
-import keyword
 import logging
-import re
+import threading
 from collections.abc import Mapping
 
 
@@ -106,32 +114,6 @@ class _Raw:
         return f'_Raw({self.value!r})'
 
 
-class _Expr:
-    """A pre-translated Python expression, evaluated lazily via :func:`eval`.
-
-    The expression's free identifiers are looked up in the registry (each
-    resolved on demand and added to the eval's ``locals``); Python
-    keywords are left to the language. Lets source-language parsers
-    defer compile-time arithmetic — ``sizeof(T)`` array lengths,
-    constant-folded enum values, complex bitfield widths — to a single
-    Python ``eval()`` rather than re-implementing operator precedence
-    by hand. Callers are responsible for translating their source
-    language to Python-evaluable text before constructing the node.
-    """
-
-    __slots__ = ('source',)
-
-    def __init__(self, source: str):
-        self.source = source
-
-    def __repr__(self):
-        return f'_Expr({self.source!r})'
-
-
-_PY_KEYWORDS = frozenset(keyword.kwlist)
-_IDENT_RE = re.compile(r'\b[A-Za-z_]\w*\b')
-
-
 class Lazy(Mapping):
     """Memoising registry. Force a key via :meth:`__call__`; raw via ``[]``.
 
@@ -145,13 +127,24 @@ class Lazy(Mapping):
     cache. Unlike the DSL kernel, no ``freeze()`` pass walks the data
     structure at init time, so cold start is dominated by ``len(data)``
     not by tree depth.
+
+    Forcing is thread-safe: :meth:`__call__` takes ``_lock`` on the
+    cache-miss path, so two threads racing the same key can't each
+    build a value and hand out two distinct ctypes classes for one
+    Vulkan type. Cache *hits* stay lock-free.
     """
 
-    __slots__ = ('_data', '_cache')
+    __slots__ = ('_data', '_cache', '_lock')
 
     def __init__(self, data):
         self._data = data
         self._cache = {}
+        # Re-entrant because resolution nests: forcing a struct resolves
+        # its field types through the same __call__, and make_struct
+        # calls registry._resolve on the quoted field list while its own
+        # force frame is still open. A plain Lock would self-deadlock on
+        # the first cross-reference.
+        self._lock = threading.RLock()
 
     # --- Mapping protocol over the raw data ---------------------------------
 
@@ -178,34 +171,48 @@ class Lazy(Mapping):
         resolution (``A`` references ``B`` which references ``A``)
         raises :class:`ValueError` instead of recursing — see the
         ``_RESOLVING`` sentinel below.
+
+        Double-checked: the fast path reads the cache without the lock
+        (a dict get is atomic under the GIL), and only a miss pays for
+        acquisition. Note the fast path deliberately treats
+        ``_RESOLVING`` as a *miss* — that sentinel means "some frame is
+        building this", which is a cycle only when it's our own frame.
+        Another thread's in-flight build must block on the lock and
+        re-read, not raise.
         """
         cached = self._cache.get(key, _MISSING)
-        if cached is _RESOLVING:
-            raise ValueError(f"cyclic key reference: {key!r}")
-        if cached is not _MISSING:
+        if cached is not _MISSING and cached is not _RESOLVING:
             return cached
-        if key not in self._data:
-            raise KeyError(key)
-        # One DEBUG record per cache-miss force. Cache hits stay silent
-        # so a "show me everything that was resolved" trace doesn't get
-        # diluted with re-access noise — every line in the log is one
-        # additional ctypes type materialised.
-        logger.debug('force %s', key)
-        self._cache[key] = _RESOLVING
-        try:
-            value = self._resolve(self._data[key])
-        except BaseException:
-            del self._cache[key]
-            raise
-        self._cache[key] = value
-        return value
+        with self._lock:
+            # Re-read: a thread that was building this key may have
+            # finished while we waited. Inside the lock _RESOLVING can
+            # only be our own frame, so it does mean a cycle.
+            cached = self._cache.get(key, _MISSING)
+            if cached is _RESOLVING:
+                raise ValueError(f"cyclic key reference: {key!r}")
+            if cached is not _MISSING:
+                return cached
+            if key not in self._data:
+                raise KeyError(key)
+            # One DEBUG record per cache-miss force. Cache hits stay
+            # silent so a "show me everything that was resolved" trace
+            # doesn't get diluted with re-access noise — every line in
+            # the log is one additional ctypes type materialised.
+            logger.debug('force %s', key)
+            self._cache[key] = _RESOLVING
+            try:
+                value = self._resolve(self._data[key])
+            except BaseException:
+                del self._cache[key]
+                raise
+            self._cache[key] = value
+            return value
 
     def _resolve(self, v):
         """Recursively force a thunk graph fragment.
 
         - :data:`SELF` → the registry itself.
         - :class:`_Raw` → its wrapped value (quote: don't descend).
-        - :class:`_Expr` → Python ``eval`` with registry names as locals.
         - :class:`_Thunk` → resolve fn and each arg, then ``fn(*args)``.
         - ``list`` / ``dict`` → element-wise descent (so the JSON-shaped
           tree of struct member entries resolves the per-field type
@@ -221,8 +228,6 @@ class Lazy(Mapping):
             return self
         if isinstance(v, _Raw):
             return v.value
-        if isinstance(v, _Expr):
-            return self._eval_expr(v.source)
         if isinstance(v, _Thunk):
             fn = self._resolve(v.fn)
             args = [self._resolve(a) for a in v.args]
@@ -232,26 +237,6 @@ class Lazy(Mapping):
         if isinstance(v, dict):
             return {k: self._resolve(x) for k, x in v.items()}
         return v
-
-    def _eval_expr(self, source: str):
-        """Evaluate a Python expression with registry entries as locals.
-
-        Walks the expression text for identifiers, forces each one
-        through the registry (skipping Python keywords and anything the
-        registry doesn't know), and hands the resulting dict to
-        :func:`eval`. Unresolved names fall through to ``NameError`` at
-        eval time — which the caller's force frame surfaces as a
-        normal resolution failure.
-        """
-        locals_dict: dict = {}
-        for ident in set(_IDENT_RE.findall(source)):
-            if ident in _PY_KEYWORDS:
-                continue
-            try:
-                locals_dict[ident] = self(ident)
-            except (KeyError, ValueError):
-                pass
-        return eval(source, {}, locals_dict)
 
     def __repr__(self):
         return f'Lazy(keys={len(self._data)}, cached={len(self._cache)})'

@@ -9,8 +9,11 @@ all in the host:
   (~50-line kernel) rather than :class:`lazyregistry.dsl.Registry`
   (~500-line template-evaluation language). Storage is mutable, no
   ``freeze()`` pass at construction.
-- :func:`build_registry` plumbs through the same call sites; the only
-  visible change is the parser module it imports.
+- :func:`build_registry` has diverged: it takes volkano's own source
+  vocabulary (see :func:`volkano.xml_source.resolve_source`), defers
+  opening the Vulkan loader to the first command force, and records the
+  provenance of the XML it parsed. It has no ``refresh`` parameter and
+  no knowledge of the ``.pyi`` stub.
 """
 
 from __future__ import annotations
@@ -238,9 +241,25 @@ class CommandSignature:
     and configures ctypes argtypes/restype. After binding, callable
     directly via ``__call__``. Calls before binding raise a descriptive
     :class:`RuntimeError`.
+
+    ``_unbound`` records *why* binding didn't happen, set by
+    :func:`make_command` which is the only place that knows. Three
+    causes look identical from here but need very different fixes, and
+    guessing at the wrong one sends people hunting for a
+    ``vkGetInstanceProcAddr`` problem when their loader simply isn't
+    installed.
     """
 
-    __slots__ = ('name', 'rettype', 'params', 'attrs', '_fn')
+    __slots__ = ('name', 'rettype', 'params', 'attrs', '_fn', '_unbound')
+
+    #: ``_unbound`` values. ``NO_LIBRARY``: the registry was built with
+    #: ``library=None``, so nothing was ever opened. ``OPEN_FAILED``: a
+    #: loader was requested but ``ctypes.CDLL`` refused it (a warning was
+    #: already logged). ``NOT_EXPORTED``: the loader opened fine and
+    #: simply doesn't export this symbol.
+    NO_LIBRARY = 'no-library'
+    OPEN_FAILED = 'open-failed'
+    NOT_EXPORTED = 'not-exported'
 
     def __init__(self, name, rettype, params, attrs):
         self.name = name
@@ -248,6 +267,7 @@ class CommandSignature:
         self.params = params
         self.attrs = attrs
         self._fn = None
+        self._unbound = self.NO_LIBRARY
 
     def bind(self, dll):
         try:
@@ -257,6 +277,7 @@ class CommandSignature:
             # loader doesn't surface — they need vkGetInstanceProcAddr /
             # vkGetDeviceProcAddr. Log at DEBUG so the noise is opt-in.
             logger.debug('command %s not exported by loader', self.name)
+            self._unbound = self.NOT_EXPORTED
             return None
         fn.argtypes = tuple(friendly(p[1]) for p in self.params)
         fn.restype = friendly(self.rettype) if self.rettype is not None else None
@@ -267,14 +288,21 @@ class CommandSignature:
     def __call__(self, *args):
         if self._fn is None:
             raise RuntimeError(
-                f"Command {self.name!r} is not bound. Either the Vulkan "
-                f"loader doesn't export this entry point (typical for "
-                f"extension commands — fetch via vkGetInstanceProcAddr / "
-                f"vkGetDeviceProcAddr instead), or the registry was built "
-                f"without a library (pass library=True to build_registry, "
-                f"or call vk.attach_library(...) followed by "
-                f"vk.rebind_commands()).")
+                f"Command {self.name!r} is not bound: {self._reason()}")
         return self._fn(*args)
+
+    def _reason(self):
+        if self._unbound == self.NOT_EXPORTED:
+            return ("the Vulkan loader doesn't export this entry point. That's "
+                    "normal for extension commands - fetch it at runtime via "
+                    "vkGetInstanceProcAddr / vkGetDeviceProcAddr.")
+        if self._unbound == self.OPEN_FAILED:
+            return ("the Vulkan loader could not be opened (a warning naming "
+                    "the path was logged when it was first needed). Install a "
+                    "Vulkan runtime, or point VOLKANO_LIBRARY at the loader.")
+        return ("this registry was built with library=None, so no loader was "
+                "ever opened. Use volkano.registry(..., library=True), or "
+                "call attach_library(...) then rebind_commands().")
 
     def __repr__(self):
         state = 'bound' if self._fn is not None else 'unbound'
@@ -284,15 +312,24 @@ class CommandSignature:
 def make_command(registry, name, rettype, params=(), attrs=None):
     """``<command>`` — produces a :class:`CommandSignature`.
 
-    Eagerly binds against ``registry._library`` if one is attached, so
-    every force of a command name returns a directly-callable bound
-    function. With Registry caching, this means *forcing a command =
-    binding it once*.
+    Binds against the registry's loader, opening it on the first command
+    force — this is the point where a deferred ``library=`` spec is
+    actually realised. Every subsequent force finds it already open, so
+    *forcing a command = binding it once*.
+
+    ``_ensure_library`` is reached through :func:`getattr` because the
+    factories are also called with ``registry=None`` (and with plain
+    :class:`Lazy` instances) in tests.
     """
     sig = CommandSignature(name, rettype, list(params), dict(attrs or {}))
-    lib = getattr(registry, '_library', None)
+    ensure = getattr(registry, '_ensure_library', None)
+    lib = ensure() if ensure is not None else None
     if lib is not None:
         sig.bind(lib)
+    elif getattr(registry, '_library_spec', None) is not None:
+        # A loader was asked for and we failed to open it — distinct from
+        # never having asked, and the warning is already in the log.
+        sig._unbound = sig.OPEN_FAILED
     return sig
 
 
@@ -310,45 +347,98 @@ class VkRegistry(Lazy):
     the factories. The only thing different is the parent kernel.
     """
 
-    __slots__ = ('_library',)
+    __slots__ = ('_library', '_library_spec', '_library_resolved', '_provenance')
 
     def __init__(self, data, *, library=None):
         super().__init__(data)
         self._library = None
-        if library is not None:
-            self.attach_library(library)
+        # The spec is held, not realised: opening the loader is deferred
+        # to the first *command* force, so constants, enums and structs
+        # resolve on a machine with no Vulkan driver installed. Building
+        # a registry is a parsing job; it shouldn't need a GPU stack.
+        self._library_spec = library
+        self._library_resolved = library is None
+        self._provenance = None
+
+    def _open_library(self, spec):
+        """Realise a library spec into an open DSO handle.
+
+        ``spec`` may be ``True`` (autodetect by platform), a filename /
+        path string (handed to :class:`ctypes.CDLL`), or an already-open
+        CDLL-like object, which passes through untouched.
+        """
+        if spec is True:
+            spec = _default_library_path()
+        if isinstance(spec, str):
+            spec = ctypes.CDLL(spec)
+        return spec
+
+    def _ensure_library(self):
+        """Open the deferred library spec once; return the handle or ``None``.
+
+        Never raises. A missing loader has to leave commands *resolvable
+        but unbound*, because :func:`volkano.stub.write_stub` forces
+        every key inside a blanket ``except Exception`` — raising here
+        would quietly reduce every command in the generated stub to
+        ``Any`` on any machine without a driver. The failure surfaces
+        instead at call time, via :meth:`CommandSignature._reason`.
+        """
+        if self._library_resolved:
+            return self._library
+        with self._lock:
+            if self._library_resolved:
+                return self._library
+            spec = self._library_spec
+            try:
+                library = self._open_library(spec)
+            except OSError as exc:
+                logger.warning(
+                    'could not open the Vulkan loader (%s): %s - commands '
+                    'will resolve unbound', spec, exc)
+                library = None
+            else:
+                # ``_name`` is set by ctypes.CDLL.__init__; falls back to
+                # repr if a caller hands us a custom DSO-like object.
+                logger.info('attached library: %s',
+                            getattr(library, '_name', None) or repr(library))
+            self._library = library
+            # Set last, and under the lock: a reader that sees this flag
+            # must also see the handle, or it would bind against None.
+            self._library_resolved = True
+            return library
 
     def attach_library(self, library):
         """Attach a Vulkan loader DSO so subsequent command forces bind.
 
         ``library`` may be ``True`` (autodetect), a filename / path
         string (passed to :class:`ctypes.CDLL`), or an already-open
-        :class:`ctypes.CDLL` instance. Attaching *after* commands have
+        :class:`ctypes.CDLL` instance. Unlike the deferred path this is
+        eager and *does* raise on a bad path — it's an explicit act, so
+        silence would be unhelpful. Attaching after commands have
         already been forced won't retroactively bind them — call
         :meth:`rebind_commands` in that case.
         """
-        if library is True:
-            library = _default_library_path()
-        if isinstance(library, str):
-            library = ctypes.CDLL(library)
-        self._library = library
-        # ``_name`` is set by ctypes.CDLL.__init__; falls back to repr
-        # if a caller hands us a custom DSO-like object.
+        with self._lock:
+            library = self._open_library(library)
+            self._library = library
+            self._library_spec = library
+            self._library_resolved = True
         logger.info('attached library: %s',
                     getattr(library, '_name', None) or repr(library))
         return library
 
     def rebind_commands(self):
         """Walk the cache and bind every already-forced :class:`CommandSignature`."""
-        if self._library is None:
+        library = self._ensure_library()
+        if library is None:
             return 0
         bound = 0
         for value in self._cache.values():
             if isinstance(value, CommandSignature) and value._fn is None:
-                if value.bind(self._library) is not None:
+                if value.bind(library) is not None:
                     bound += 1
         logger.info('rebound %d command(s) against %s',
-                    bound, getattr(self._library, '_name', None) or repr(self._library))
+                    bound, getattr(library, '_name', None) or repr(library))
         return bound
 
     def __getattr__(self, name):
@@ -379,24 +469,30 @@ def _default_library_path():
     return 'libvulkan.so.1'
 
 
-def build_registry(source=None, *, library=None, refresh=False):
+def build_registry(source=None, *, library=None, api='vulkan'):
     """Construct a :class:`VkRegistry` from a Vulkan XML registry.
 
-    Same signature and semantics as
-    :func:`lazyregistry.vulkan_stdlib.build_registry`:
+    - ``source`` is ``None`` / ``'main'`` (Khronos main branch), a
+      version like ``'1.4.359'``, a filesystem path, or an
+      :class:`xml.etree.ElementTree.Element`. See
+      :func:`volkano.xml_source.resolve_source`.
+    - ``library`` is the loader spec — ``None`` (attach nothing),
+      ``True`` (autodetect), a path, or an open CDLL. It is *held*, not
+      opened: see :meth:`VkRegistry._ensure_library`.
 
-    - ``source`` is ``None`` (fetch from GitHub), a URL, a filesystem
-      path, or an :class:`xml.etree.ElementTree.Element`.
-    - ``library`` opens the Vulkan loader at construction time and
-      enables lazy command binding.
-    - ``refresh=True`` forces a redownload of cached XML.
+    This module deliberately knows nothing about the ``.pyi`` stub.
+    Keeping the stub out of the build path is what makes "a registry you
+    construct yourself never writes to your source tree" a structural
+    property rather than a flag a caller could get wrong — only the
+    package facade syncs the stub, via :func:`volkano.stub.sync_stub`.
     """
-    from .xml_parser import parse_xml
+    from .xml_parser import parse_registry
     import time
     t0 = time.perf_counter()
-    data = parse_xml(source, refresh=refresh)
+    data, provenance = parse_registry(source, api=api)
     merged: dict = {**STDLIB, **data}
     registry = VkRegistry(merged, library=library)
+    registry._provenance = provenance
     elapsed_ms = (time.perf_counter() - t0) * 1000
     logger.info('built registry: %d entries in %.1f ms', len(registry), elapsed_ms)
     return registry

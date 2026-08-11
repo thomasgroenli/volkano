@@ -38,7 +38,3 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
-
-# Auto-generated stub — uncomment to exclude from the repo. Committing it
-# gives downstream users IDE autocomplete without running stub.py first.
-# volkano/__init__.pyi
