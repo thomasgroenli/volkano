@@ -11,7 +11,7 @@ all in the host:
   ``freeze()`` pass at construction.
 - :func:`build_registry` has diverged: it takes volkano's own source
   vocabulary (see :func:`volkano.xml_source.resolve_source`), defers
-  opening the Vulkan loader to the first command force, and records the
+  opening the Vulkan loader to the first command *call*, and records the
   provenance of the XML it parsed. It has no ``refresh`` parameter and
   no knowledge of the ``.pyi`` stub.
 """
@@ -238,36 +238,46 @@ class CommandSignature:
     """Lazy ctypes binding for one Vulkan command.
 
     Cheap to construct; :meth:`bind` resolves the symbol on an open DLL
-    and configures ctypes argtypes/restype. After binding, callable
-    directly via ``__call__``. Calls before binding raise a descriptive
-    :class:`RuntimeError`.
+    and configures ctypes argtypes/restype. Binding happens on the first
+    ``__call__`` — that is the only operation that genuinely needs a
+    loader, so resolving, introspecting or stubbing a command behaves
+    like every other registry entry and touches no DSO. A call that
+    can't bind raises a descriptive :class:`RuntimeError`.
 
-    ``_unbound`` records *why* binding didn't happen, set by
-    :func:`make_command` which is the only place that knows. Three
-    causes look identical from here but need very different fixes, and
-    guessing at the wrong one sends people hunting for a
-    ``vkGetInstanceProcAddr`` problem when their loader simply isn't
-    installed.
+    ``registry`` is the :class:`VkRegistry` to ask for a loader when
+    that first call arrives; ``None`` (the default, and what the
+    factories get in tests) means "never bindable". The reference is
+    strong — registry and cache already form a cycle through every
+    other forced value, and none of it defines ``__del__``.
+
+    ``_unbound`` records *why* binding didn't happen, and stays ``None``
+    until something actually tries — an untried signature is not a
+    failed one. Three causes look identical from the call site but need
+    very different fixes, and guessing at the wrong one sends people
+    hunting for a ``vkGetInstanceProcAddr`` problem when their loader
+    simply isn't installed.
     """
 
-    __slots__ = ('name', 'rettype', 'params', 'attrs', '_fn', '_unbound')
+    __slots__ = ('name', 'rettype', 'params', 'attrs',
+                 '_fn', '_unbound', '_registry')
 
     #: ``_unbound`` values. ``NO_LIBRARY``: the registry was built with
-    #: ``library=None``, so nothing was ever opened. ``OPEN_FAILED``: a
+    #: ``library=None``, so there was nothing to open. ``OPEN_FAILED``: a
     #: loader was requested but ``ctypes.CDLL`` refused it (a warning was
     #: already logged). ``NOT_EXPORTED``: the loader opened fine and
-    #: simply doesn't export this symbol.
+    #: simply doesn't export this symbol. ``None``: no bind attempted yet.
     NO_LIBRARY = 'no-library'
     OPEN_FAILED = 'open-failed'
     NOT_EXPORTED = 'not-exported'
 
-    def __init__(self, name, rettype, params, attrs):
+    def __init__(self, name, rettype, params, attrs, registry=None):
         self.name = name
         self.rettype = rettype
         self.params = params
         self.attrs = attrs
         self._fn = None
-        self._unbound = self.NO_LIBRARY
+        self._unbound = None
+        self._registry = registry
 
     def bind(self, dll):
         try:
@@ -286,10 +296,42 @@ class CommandSignature:
         return fn
 
     def __call__(self, *args):
-        if self._fn is None:
-            raise RuntimeError(
-                f"Command {self.name!r} is not bound: {self._reason()}")
-        return self._fn(*args)
+        # The bound path costs one attribute load and a branch — the
+        # same check that used to only raise now also carries the
+        # deferred bind, so nothing was added to the hot path.
+        fn = self._fn
+        if fn is None:
+            fn = self._bind_now()
+        return fn(*args)
+
+    def _bind_now(self):
+        """Cold path: realise the registry's loader and resolve the symbol.
+
+        Reached once per command — after a successful bind ``_fn`` short-
+        circuits it forever. Reached again on every call for a command
+        that *failed* to bind, which is deliberate: a loader attached
+        after the first failed call (or one that gained the export)
+        binds on the next call, with no :meth:`VkRegistry.rebind_commands`
+        needed.
+
+        ``_ensure_library`` is reached through :func:`getattr` because a
+        signature may hold no registry at all, or a plain :class:`Lazy`
+        (both happen in tests).
+        """
+        registry = self._registry
+        ensure = getattr(registry, '_ensure_library', None)
+        library = ensure() if ensure is not None else None
+        if library is None:
+            # A loader that was asked for and couldn't be opened is a
+            # different problem from one that was never asked for; the
+            # warning naming the path is already in the log.
+            self._unbound = (self.OPEN_FAILED
+                             if getattr(registry, '_library_spec', None) is not None
+                             else self.NO_LIBRARY)
+        elif self.bind(library) is not None:
+            return self._fn
+        raise RuntimeError(
+            f"Command {self.name!r} is not bound: {self._reason()}")
 
     def _reason(self):
         if self._unbound == self.NOT_EXPORTED:
@@ -300,37 +342,34 @@ class CommandSignature:
             return ("the Vulkan loader could not be opened (a warning naming "
                     "the path was logged when it was first needed). Install a "
                     "Vulkan runtime, or point VOLKANO_LIBRARY at the loader.")
-        return ("this registry was built with library=None, so no loader was "
-                "ever opened. Use volkano.registry(..., library=True), or "
-                "call attach_library(...) then rebind_commands().")
+        return ("this registry was built with library=None, so there was no "
+                "loader to bind against. Use volkano.registry(..., "
+                "library=True), or call attach_library(...) and call again.")
 
     def __repr__(self):
-        state = 'bound' if self._fn is not None else 'unbound'
+        if self._fn is not None:
+            state = 'bound'
+        elif self._unbound is None:
+            # Binding is deferred to the first call, so "unbound" here
+            # would read as a diagnosis nothing has actually made yet.
+            state = 'unbound, binds on call'
+        else:
+            state = f'unbound: {self._unbound}'
         return f'<CommandSignature {self.name} ({state})>'
 
 
 def make_command(registry, name, rettype, params=(), attrs=None):
     """``<command>`` — produces a :class:`CommandSignature`.
 
-    Binds against the registry's loader, opening it on the first command
-    force — this is the point where a deferred ``library=`` spec is
-    actually realised. Every subsequent force finds it already open, so
-    *forcing a command = binding it once*.
-
-    ``_ensure_library`` is reached through :func:`getattr` because the
-    factories are also called with ``registry=None`` (and with plain
-    :class:`Lazy` instances) in tests.
+    Pure data: the signature records the registry to ask for a loader
+    later and opens nothing. Forcing a command is therefore exactly as
+    cheap and as driver-independent as forcing a struct or an enum;
+    :meth:`CommandSignature._bind_now` realises a deferred ``library=``
+    spec on the first *call*, which is the only operation that needs
+    one.
     """
-    sig = CommandSignature(name, rettype, list(params), dict(attrs or {}))
-    ensure = getattr(registry, '_ensure_library', None)
-    lib = ensure() if ensure is not None else None
-    if lib is not None:
-        sig.bind(lib)
-    elif getattr(registry, '_library_spec', None) is not None:
-        # A loader was asked for and we failed to open it — distinct from
-        # never having asked, and the warning is already in the log.
-        sig._unbound = sig.OPEN_FAILED
-    return sig
+    return CommandSignature(name, rettype, list(params), dict(attrs or {}),
+                            registry)
 
 
 # ---------------------------------------------------------------------------
@@ -340,11 +379,14 @@ def make_command(registry, name, rettype, params=(), attrs=None):
 class VkRegistry(Lazy):
     """Vulkan-flavoured :class:`Lazy` with attribute access and lazy binding.
 
-    Mirrors :class:`lazyregistry.vulkan_stdlib.VkRegistry` exactly —
-    same ``__getattr__`` semantics, same ``attach_library`` /
+    Mirrors :class:`lazyregistry.vulkan_stdlib.VkRegistry` — same
+    ``__getattr__`` semantics, same ``attach_library`` /
     ``rebind_commands`` surface, same ``.ptr`` / ``.ref`` instance
     shortcuts wired into every struct/union/handle class produced by
-    the factories. The only thing different is the parent kernel.
+    the factories. Beyond the parent kernel, the one behavioural
+    difference is *when* the loader opens: here nothing but an actual
+    command call triggers it, so the loader plays no part in
+    resolution.
     """
 
     __slots__ = ('_library', '_library_spec', '_library_resolved', '_provenance')
@@ -353,9 +395,10 @@ class VkRegistry(Lazy):
         super().__init__(data)
         self._library = None
         # The spec is held, not realised: opening the loader is deferred
-        # to the first *command* force, so constants, enums and structs
-        # resolve on a machine with no Vulkan driver installed. Building
-        # a registry is a parsing job; it shouldn't need a GPU stack.
+        # to the first *command call*, so the whole registry — commands
+        # included — resolves on a machine with no Vulkan driver
+        # installed. Building a registry is a parsing job; it shouldn't
+        # need a GPU stack, and neither should reading a signature back.
         self._library_spec = library
         self._library_resolved = library is None
         self._provenance = None
@@ -376,12 +419,12 @@ class VkRegistry(Lazy):
     def _ensure_library(self):
         """Open the deferred library spec once; return the handle or ``None``.
 
-        Never raises. A missing loader has to leave commands *resolvable
-        but unbound*, because :func:`volkano.stub.write_stub` forces
-        every key inside a blanket ``except Exception`` — raising here
-        would quietly reduce every command in the generated stub to
-        ``Any`` on any machine without a driver. The failure surfaces
-        instead at call time, via :meth:`CommandSignature._reason`.
+        Never raises. Callers are :meth:`CommandSignature._bind_now` and
+        :meth:`rebind_commands`, neither of which wants an ``OSError``
+        from three frames down: the call site raises its own
+        :class:`RuntimeError` carrying :meth:`CommandSignature._reason`,
+        which names the actual fix, and the bulk rebind reports a count.
+        The path that failed is in the warning logged here.
         """
         if self._library_resolved:
             return self._library
@@ -408,15 +451,16 @@ class VkRegistry(Lazy):
             return library
 
     def attach_library(self, library):
-        """Attach a Vulkan loader DSO so subsequent command forces bind.
+        """Attach a Vulkan loader DSO for subsequent command calls to bind against.
 
         ``library`` may be ``True`` (autodetect), a filename / path
         string (passed to :class:`ctypes.CDLL`), or an already-open
         :class:`ctypes.CDLL` instance. Unlike the deferred path this is
         eager and *does* raise on a bad path — it's an explicit act, so
-        silence would be unhelpful. Attaching after commands have
-        already been forced won't retroactively bind them — call
-        :meth:`rebind_commands` in that case.
+        silence would be unhelpful. Attaching at any point before a
+        command is called is enough, however many commands have been
+        forced by then; :meth:`rebind_commands` only matters if you want
+        them bound *now* rather than on first call.
         """
         with self._lock:
             library = self._open_library(library)
@@ -428,7 +472,14 @@ class VkRegistry(Lazy):
         return library
 
     def rebind_commands(self):
-        """Walk the cache and bind every already-forced :class:`CommandSignature`."""
+        """Eagerly bind every already-forced :class:`CommandSignature`.
+
+        Not required for correctness — each command binds itself on its
+        first call. This is the bulk, up-front version: it opens the
+        loader, walks the cache, and returns how many symbols resolved,
+        which makes it the way to answer "how much of this registry can
+        this loader actually dispatch?" without calling anything.
+        """
         library = self._ensure_library()
         if library is None:
             return 0

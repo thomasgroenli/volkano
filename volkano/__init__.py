@@ -78,7 +78,7 @@ def registry(source: Any = None, *, library: Any = None):
     :class:`~xml.etree.ElementTree.Element`. ``library`` is ``None``
     (attach nothing), ``True`` (autodetect), a path, or an open CDLL;
     either way the loader is not opened until the first command is
-    resolved.
+    actually called.
 
     A pure function of its arguments — it reads no environment and
     touches no global state, so several registries can coexist and none

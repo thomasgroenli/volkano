@@ -69,9 +69,10 @@ python -m volkano.stub --refresh
 
 ## Notes
 
-- **The loader is opened lazily** — on the first *command* you resolve, not
-  at build. Constants, enums and structs work on a machine with no Vulkan
-  driver installed.
+- **The loader is opened lazily** — on the first *command you call*, not at
+  build and not at lookup. The entire registry, commands included, resolves
+  and introspects on a machine with no Vulkan driver installed; only
+  dispatch needs one.
 - **`__init__.pyi` is generated**, stamped with the hash of the XML it came
   from, and rewritten whenever the two disagree. Only the module facade
   does this; `registry()` never touches it.

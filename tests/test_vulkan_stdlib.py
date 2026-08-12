@@ -204,13 +204,15 @@ class CommandTests(unittest.TestCase):
         self.assertIsNone(sig.bind(_FakeDll([])))
         self.assertIsNone(sig._fn)
 
-    def test_command_eager_binds_when_library_attached_at_force(self):
+    def test_command_binds_on_first_call_not_at_force(self):
         dll = _FakeDll(['vkAuto'])
         r = VkRegistry({**STDLIB,
                         'vkAuto': _Thunk(make_command, SELF, 'vkAuto', None,
                                          _Raw(()), _Raw({}))},
                        library=dll)
         sig = r('vkAuto')
+        self.assertIsNone(sig._fn)
+        self.assertEqual(sig(), 'vkAuto')
         self.assertIs(sig._fn, dll._fns['vkAuto'])
 
     def test_rebind_commands_binds_only_unbound_in_cache(self):
