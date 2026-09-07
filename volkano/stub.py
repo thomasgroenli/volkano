@@ -10,29 +10,35 @@ servers gain full coverage of the Vulkan API surface.
 
 Use as a CLI::
 
-    python -m volkano.stub                  # writes volkano/__init__.pyi
-    python -m volkano.stub -o other.pyi     # custom path
-    python -m volkano.stub --refresh        # redownload main.xml first
+    python -m volkano update                # refetch, then rewrite the stub
+    python -m volkano update -o other.pyi   # write it somewhere else
 
 Or programmatically::
 
-    from volkano.stub import write_stub
-    write_stub()
+    from volkano.stub import update
+    update()
 
 The stub carries a provenance stamp on its first line naming the
 sha256 of the XML it was generated from. :func:`sync_stub` compares
 that against the registry it is handed and rewrites only on a
-mismatch, so the file tracks whichever ``vk.xml`` the package facade
-is actually built from. Stamping content rather than keying off "did
-we just download something" is what makes it self-healing: a deleted
-stub, a pre-populated cache and an interrupted write all repair
-themselves on the next import.
+mismatch. Stamping content rather than keying off "did we just
+download something" is what makes it self-healing: a deleted stub, a
+pre-populated cache and an interrupted write all repair themselves on
+the next ``update``.
 
-Only the package facade (:func:`volkano.get_registry`) syncs the stub.
-A registry built through :func:`volkano.registry` never touches it.
+**Importing volkano never writes this file.** Generating it forces
+every one of the 8 000+ registry entries and writes about a megabyte
+into the installed package, which is not something an import should
+do: it is slow on a cold install, it fails silently on a read-only
+prefix, and two projects sharing a virtualenv with different sources
+would take turns overwriting each other's copy.
+:func:`volkano.get_registry` instead calls :func:`stub_is_stale` —
+which reads one line and forces nothing — and logs a note pointing at
+``python -m volkano update``.
 
-The stub is purely a hint for tooling — the package itself works
-without it.
+The stub is purely a hint for tooling; the package itself works
+without it, which is what makes deferring it to an explicit command
+affordable.
 """
 
 from __future__ import annotations
@@ -59,7 +65,7 @@ logger = logging.getLogger('volkano.stub')
 
 _HEADER = '''\
 # Auto-generated stub for the volkano package — do not edit by hand.
-# Regenerate with: python -m volkano.stub
+# Regenerate with: python -m volkano update
 #
 # Every name here is resolved dynamically at runtime via PEP 562
 # __getattr__ on the package; this file exists purely so static
@@ -119,6 +125,21 @@ def _classify(value: Any) -> str:
         return 'command'
     if isinstance(value, bool):
         return 'bool'
+    # Before the int check, and deliberately: an enum member *is* an
+    # int, and since enumerants resolve to their group's member
+    # (:func:`vulkan_stdlib.enum_member`) the plain-int branch would
+    # claim nearly every constant in the registry and annotate it
+    # ``int``. A composite IntFlag value has no name to spell and falls
+    # through to that branch, which is the honest rendering for it.
+    if isinstance(value, enum.Enum):
+        # The name has to round-trip as a single attribute of its class:
+        # a composite IntFlag value is nameless on 3.10 and named
+        # ``'A|B'`` from 3.11 on, and neither can be spelled as one
+        # attribute access. Those render as plain ints.
+        mname = value.name
+        if mname and getattr(type(value), mname, None) is value:
+            return 'enum_member'
+        return 'int'
     if isinstance(value, int):
         return 'int'
     if isinstance(value, float):
@@ -180,7 +201,17 @@ def _emit_constant(out: IO[str], name: str, value: Any, kind: str) -> None:
     you almost always want to know "what number is ``VK_STRUCTURE_-
     TYPE_APPLICATION_INFO`` again?" without scrolling to the source.
     """
-    if kind == 'int':
+    if kind == 'enum_member':
+        # ``{value}`` is not usable here: IntEnum's ``__str__``
+        # prints the member on 3.10 and the bare number from 3.11
+        # on. Spelling the group and the member out keeps the stub
+        # identical across interpreters - and annotating with the
+        # group rather than ``int`` is what tells an IDE that
+        # ``vk.VK_SUCCESS`` and ``VkResult.VK_SUCCESS`` are the
+        # same object.
+        group = type(value).__name__
+        out.write(f'{name}: {group} = {group}.{value.name}\n')
+    elif kind == 'int':
         out.write(f'{name}: int = {value}\n')
     elif kind == 'float':
         out.write(f'{name}: float = {value!r}\n')
@@ -298,8 +329,9 @@ def default_stub_path() -> str:
 #: detect that: identical input plus improved code yields a different
 #: (and previously wrong) stub, which would otherwise never be
 #: rewritten — leaving the stub contradicting the runtime on specific
-#: values. Bumped to 2 when parse_int stopped eating hex digits.
-_GENERATOR = 2
+#: values. Bumped to 2 when parse_int stopped eating hex digits, and
+#: to 3 when enumerants became enum members rather than bare ints.
+_GENERATOR = 3
 
 # The provenance stamp is written as its own first line rather than
 # folded into _HEADER, so the template stays free of format braces and
@@ -313,15 +345,15 @@ def _stamp_line(provenance: Any) -> str:
     return (f'# volkano-stub: sha256={provenance.sha256} '
             f'gen={_GENERATOR} '
             f'header-version={provenance.header_version} '
-            f'source={provenance.label}\n')
+            f'source={provenance.uri}\n')
 
 
 def _expected_stamp(provenance: Any) -> tuple[str, int, str]:
-    return (provenance.sha256, _GENERATOR, provenance.label)
+    return (provenance.sha256, _GENERATOR, provenance.uri)
 
 
 def read_stub_provenance(path: str) -> tuple[str, int, str] | None:
-    """Return ``(sha256, generator, source_label)`` from a stub's stamp.
+    """Return ``(sha256, generator, source_uri)`` from a stub's stamp.
 
     ``None`` if the file is absent, unreadable, or predates the current
     stamp format — all of which mean "regenerate", so the caller needs
@@ -340,13 +372,30 @@ def read_stub_provenance(path: str) -> tuple[str, int, str] | None:
     return None
 
 
+def stub_is_stale(registry: Any, *, path: str | None = None) -> bool:
+    """Whether ``path``'s stamp disagrees with ``registry``.
+
+    The cheap half of :func:`sync_stub`: it reads one line and forces
+    nothing, so :func:`volkano.get_registry` can call it on every build
+    without paying for the walk that regenerating costs.
+
+    ``False`` for a registry with no provenance — there is nothing to
+    compare against, so there is nothing to call out of date.
+    """
+    provenance = getattr(registry, '_provenance', None)
+    if provenance is None:
+        return False
+    path = path or default_stub_path()
+    return read_stub_provenance(path) != _expected_stamp(provenance)
+
+
 def sync_stub(registry: Any, *, path: str | None = None) -> bool:
     """Regenerate ``path`` if its stamp disagrees with ``registry``.
 
     Returns ``True`` if the stub was written. Never raises: a stale stub
     costs autocomplete, not correctness, and an installed package can
     sit on a read-only prefix — neither should sink an otherwise-good
-    build.
+    ``update``.
 
     A registry with no provenance (one built from an
     :class:`~xml.etree.ElementTree.Element`, which has no identity to
@@ -361,7 +410,7 @@ def sync_stub(registry: Any, *, path: str | None = None) -> bool:
         return False
     # Log before, not after: this forces every key in the registry and
     # is the multi-second pause a user notices on a cold install.
-    logger.info('regenerating %s from %s', path, provenance.label)
+    logger.info('regenerating %s from %s', path, provenance.uri)
     try:
         count = write_stub(path, registry=registry, provenance=provenance)
     except Exception as exc:
@@ -403,7 +452,8 @@ def write_stub(path: str | None = None, *, registry: Any = None,
     buckets: dict[str, list[tuple[str, Any]]] = {
         kind: [] for kind in (
             'handle', 'enum', 'struct', 'union', 'funcpointer',
-            'command', 'int', 'float', 'str', 'bool', 'scalar', 'any', 'none')
+            'command', 'enum_member', 'int', 'float', 'str', 'bool',
+            'scalar', 'any', 'none')
     }
     skipped: list[str] = []
     for key in sorted(registry):
@@ -455,6 +505,14 @@ def write_stub(path: str | None = None, *, registry: Any = None,
                 for name, _ in buckets['funcpointer']:
                     _emit_scalar_or_funcpointer(f, name)
 
+            # After the enum classes above, which these reference by
+            # name: a reader takes a .pyi in file order, so the group
+            # has to be declared before a constant annotated with it.
+            if buckets['enum_member']:
+                f.write('\n# --- Enumerants (each resolves to its group member) ---\n')
+                for name, value in buckets['enum_member']:
+                    _emit_constant(f, name, value, 'enum_member')
+
             for const_kind in ('int', 'float', 'str', 'bool', 'none'):
                 if buckets[const_kind]:
                     f.write(f'\n# --- {const_kind.capitalize()} constants ---\n')
@@ -484,39 +542,65 @@ def write_stub(path: str | None = None, *, registry: Any = None,
     return total
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Maintenance CLI: refresh the cached XML and/or rewrite the stub.
+def update(source: Any = None, *, output: str | None = None,
+           fetch: bool = True) -> tuple[str, int]:
+    """Refetch ``source``, rebuild from it, and rewrite the stub.
 
-    This is the only supported way to move a cached ``main.xml``
-    forward. Nothing revalidates during a normal import, so without an
-    explicit ``--refresh`` the cache is authoritative indefinitely.
+    The whole of ``python -m volkano update``, minus argument parsing.
+    Returns ``(fetch_status, declarations_written)`` — the status being
+    one of :func:`~volkano.xml_source.refresh_source`'s words, or
+    ``'cached'`` when ``fetch`` is off.
+
+    This is the only supported way to move a cached URI forward.
+    Nothing revalidates during a normal import, so between two
+    ``update`` runs the cache is authoritative indefinitely.
     """
     from . import registry as build_registry
-    from .xml_source import ENV_VAR, refresh_source, resolve_source
+    from .xml_source import refresh_source, resolve_source
 
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('-o', '--output', default=None,
-                        help='where to write the .pyi (default: volkano/__init__.pyi)')
-    parser.add_argument('--source', default=None,
-                        help="'main', 'tag:<name>', 'branch:<name>', or a "
-                             f"path to a local vk.xml (default: ${ENV_VAR}, "
-                             f"else main)")
-    parser.add_argument('--refresh', action='store_true',
-                        help='redownload the source before generating '
-                             '(no-op for a tag - those never move)')
-    args = parser.parse_args(argv)
-
-    source = args.source if args.source is not None else os.environ.get(ENV_VAR)
-    if args.refresh:
-        src = resolve_source(source)
-        print(f'{src.label}: {refresh_source(src)}', file=sys.stderr)
-
+    src = resolve_source(source)
+    status = refresh_source(src) if fetch else 'cached'
     # Built through the public mode-2 entry point: no singleton, and
     # library=None so generating a stub never needs a Vulkan driver.
     reg = build_registry(source, library=None)
-    output = args.output or default_stub_path()
-    count = write_stub(output, registry=reg, provenance=reg._provenance)
-    print(f'wrote {count} declarations to {output}', file=sys.stderr)
+    count = write_stub(output or default_stub_path(), registry=reg,
+                       provenance=reg._provenance)
+    return status, count
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Argument parsing for ``python -m volkano update``.
+
+    Lives here rather than in ``__main__`` so that the command is
+    importable and testable without a subprocess.
+    """
+    from .xml_source import ENV_VAR, resolve_source
+
+    parser = argparse.ArgumentParser(
+        prog='python -m volkano', description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest='command')
+    up = sub.add_parser('update',
+                        help='refetch the XML and rewrite the .pyi stub')
+    up.add_argument('source', nargs='?', default=None,
+                    help=f'a URI or path to a vk.xml (default: ${ENV_VAR}, '
+                         f'else the Khronos main branch)')
+    up.add_argument('-o', '--output', default=None,
+                    help='where to write the .pyi (default: volkano/__init__.pyi)')
+    up.add_argument('--no-fetch', action='store_true',
+                    help='rebuild the stub from the cached XML without '
+                         'redownloading')
+    args = parser.parse_args(argv)
+    if args.command != 'update':
+        parser.print_help(sys.stderr)
+        return 2
+
+    source = args.source if args.source is not None else os.environ.get(ENV_VAR)
+    src = resolve_source(source)
+    status, count = update(source, output=args.output,
+                           fetch=not args.no_fetch)
+    print(f'{src.uri}: {status}', file=sys.stderr)
+    print(f'wrote {count} declarations to '
+          f'{args.output or default_stub_path()}', file=sys.stderr)
     return 0
 
 

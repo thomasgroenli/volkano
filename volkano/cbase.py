@@ -2,6 +2,7 @@ import ctypes
 import enum
 import operator
 import sys
+import weakref
 from _ctypes import Structure as CStructureBase
 from _ctypes import Union as CUnionBase
 from _ctypes import _Pointer as CPointerBase
@@ -1051,6 +1052,57 @@ def friendly(ctype):
         if scalar is not None:
             return scalar
     return ctype
+
+
+# Memoised int -> member decoders, keyed weakly on the enum class so a
+# discarded registry's classes stay collectable. Keyed on the class and
+# not (like :data:`_ENUM_SCALARS`) on its name, because the answer here
+# depends on the members: two registries built from different vk.xml
+# revisions have two different VkResult tables, and handing one's
+# decoder to the other would mistranslate every code the older revision
+# didn't have.
+_ENUM_DECODERS: "weakref.WeakKeyDictionary[type, object]" = weakref.WeakKeyDictionary()
+
+
+def decoder(ctype):
+    """:func:`friendly`'s inverse for a *return* value: int -> enum member.
+
+    :func:`friendly` erases an enum to its backing scalar. That is
+    exactly right going in - an :class:`enum.IntEnum` handed to a
+    ctypes ``argtype`` already *is* an int - and lossy coming back,
+    where the scalar is all the caller ever sees. This builds the
+    callable that puts the member back, for ctypes' callable-``restype``
+    slot; ``None`` means "not decodable, leave the scalar alone".
+
+    ctypes feeds a callable ``restype`` the C ``int`` the function
+    returned, so only an enum backed by :class:`int32` qualifies. That
+    is a statement about *signed*, int-sized storage and not just its
+    width: a ``uint32``-backed :class:`enum.IntFlag` is the same size,
+    but ctypes would sign-extend it and any member with bit 31 set
+    would arrive negative and silently fail to match.
+
+    An integer with no member - a result code from an extension newer
+    than the parsed XML - passes through as a plain :class:`int`. A
+    driver is entitled to return one, and a ``ValueError`` raised from
+    inside the call would be the least useful available reaction to it.
+    """
+    if not (isinstance(ctype, type) and issubclass(ctype, enum.Enum)):
+        return None
+    if friendly(ctype) is not int32:
+        return None
+    decode = _ENUM_DECODERS.get(ctype)
+    if decode is None:
+        # Iterating the class yields canonical members only, so an
+        # aliased code decodes to its primary spelling.
+        table = {int(member): member for member in ctype}
+
+        def decode(value, _get=table.get):
+            member = _get(value)
+            return value if member is None else member
+
+        decode.__name__ = f'decode_{ctype.__name__}'
+        _ENUM_DECODERS[ctype] = decode
+    return decode
 
 
 # ---------------------------------------------------------------------------

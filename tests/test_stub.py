@@ -1,6 +1,7 @@
 """Tests for stub generation and provenance-driven regeneration."""
 from __future__ import annotations
 
+import ast
 import os
 import pathlib
 import tempfile
@@ -8,12 +9,16 @@ import unittest
 import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
-from volkano import stub, vulkan_stdlib
+from volkano import cbase, stub, vulkan_stdlib
 from volkano.xml_source import Provenance
 
 
 _SHA_A = 'a' * 64
 _SHA_B = 'b' * 64
+
+_URI_A = ('https://raw.githubusercontent.com/KhronosGroup/Vulkan-Docs'
+          '/refs/heads/main/xml/vk.xml')
+_URI_B = 'file:///work/vk.xml'
 
 
 class _FakeRegistry:
@@ -58,11 +63,11 @@ class WriteStubTests(_StubPathCase):
             stub.write_stub(self.path, registry=_FakeRegistry({'VK_FOO': 1}))
 
     def test_stamp_round_trips(self):
-        provenance = Provenance(_SHA_A, 'v1.4.359', 359, 'https://example/vk.xml')
+        provenance = Provenance(_SHA_A, _URI_A, 359)
         stub.write_stub(self.path, registry=_FakeRegistry({'VK_FOO': 1}),
                         provenance=provenance)
         self.assertEqual(stub.read_stub_provenance(self.path),
-                         (_SHA_A, stub._GENERATOR, 'v1.4.359'))
+                         (_SHA_A, stub._GENERATOR, _URI_A))
 
     def test_unstamped_stub_reads_as_no_provenance(self):
         stub.write_stub(self.path, registry=_FakeRegistry({'VK_FOO': 1}))
@@ -82,12 +87,67 @@ class WriteStubTests(_StubPathCase):
         self.assertEqual(os.listdir(self.dir), ['__init__.pyi'])
 
 
+class EnumerantStubTests(_StubPathCase):
+    """An enumerant is an int, so it has to be classified before ints."""
+
+    def setUp(self):
+        super().setUp()
+        self.group = cbase.Enum.create(
+            'VkFoo', values=[('VK_FOO_A', 0)], aliases=[('VK_FOO_A_KHR', 'VK_FOO_A')])
+
+    def test_member_classifies_as_enum_member_not_int(self):
+        self.assertEqual(stub._classify(self.group.VK_FOO_A), 'enum_member')
+
+    def test_member_renders_as_the_group_attribute(self):
+        registry = _FakeRegistry({'VkFoo': self.group,
+                                  'VK_FOO_A': self.group.VK_FOO_A})
+        stub.write_stub(self.path, registry=registry)
+        self.assertIn('VK_FOO_A: VkFoo = VkFoo.VK_FOO_A', self.body())
+
+    def test_alias_renders_as_the_canonical_member(self):
+        registry = _FakeRegistry({'VkFoo': self.group,
+                                  'VK_FOO_A_KHR': self.group.VK_FOO_A_KHR})
+        stub.write_stub(self.path, registry=registry)
+        self.assertIn('VK_FOO_A_KHR: VkFoo = VkFoo.VK_FOO_A', self.body())
+
+    def test_group_is_declared_before_the_enumerants_that_name_it(self):
+        registry = _FakeRegistry({'VkFoo': self.group,
+                                  'VK_FOO_A': self.group.VK_FOO_A})
+        stub.write_stub(self.path, registry=registry)
+        body = self.body()
+        self.assertLess(body.index('class VkFoo('), body.index('VK_FOO_A: VkFoo'))
+
+    def test_stub_is_valid_python(self):
+        registry = _FakeRegistry({'VkFoo': self.group,
+                                  'VK_FOO_A': self.group.VK_FOO_A})
+        stub.write_stub(self.path, registry=registry)
+        ast.parse(self.body())
+
+    def test_composite_flag_value_falls_back_to_int(self):
+        flags = cbase.Enum.create('VkBarFlagBits',
+                                  values=[('VK_BAR_A', 1), ('VK_BAR_B', 2)],
+                                  flag=True)
+        # Nameless on 3.10, named 'VK_BAR_A|VK_BAR_B' from 3.11 on -
+        # neither spells as a single attribute access, so both render int.
+        composite = flags.VK_BAR_A | flags.VK_BAR_B
+        self.assertEqual(stub._classify(composite), 'int')
+
+    def test_declared_composite_enumerant_is_still_a_member(self):
+        # vk.xml does declare these (VK_CULL_MODE_FRONT_AND_BACK = 3);
+        # a *declared* composite is a real member and keeps its name.
+        flags = cbase.Enum.create('VkBazFlagBits',
+                                  values=[('VK_BAZ_A', 1), ('VK_BAZ_B', 2),
+                                          ('VK_BAZ_BOTH', 3)],
+                                  flag=True)
+        self.assertEqual(stub._classify(flags.VK_BAZ_BOTH), 'enum_member')
+
+
 class SyncStubTests(_StubPathCase):
     """The stamp, not "did we just download", is what triggers a rewrite."""
 
-    def _registry(self, sha, label='main'):
+    def _registry(self, sha, uri=_URI_A):
         return _FakeRegistry({'VK_FOO': 1},
-                             provenance=Provenance(sha, label, 359, None))
+                             provenance=Provenance(sha, uri, 359))
 
     def test_missing_stub_is_written(self):
         self.assertTrue(stub.sync_stub(self._registry(_SHA_A), path=self.path))
@@ -101,12 +161,12 @@ class SyncStubTests(_StubPathCase):
         stub.sync_stub(self._registry(_SHA_A), path=self.path)
         self.assertTrue(stub.sync_stub(self._registry(_SHA_B), path=self.path))
         self.assertEqual(stub.read_stub_provenance(self.path),
-                         (_SHA_B, stub._GENERATOR, 'main'))
+                         (_SHA_B, stub._GENERATOR, _URI_A))
 
-    def test_changed_label_rewrites_even_when_bytes_match(self):
-        stub.sync_stub(self._registry(_SHA_A, 'main'), path=self.path)
+    def test_changed_uri_rewrites_even_when_bytes_match(self):
+        stub.sync_stub(self._registry(_SHA_A, _URI_A), path=self.path)
         self.assertTrue(
-            stub.sync_stub(self._registry(_SHA_A, '/work/vk.xml'), path=self.path))
+            stub.sync_stub(self._registry(_SHA_A, _URI_B), path=self.path))
 
     def test_bumped_generator_rewrites_unchanged_xml(self):
         # Improving the parser or an emitter changes the stub's content
@@ -118,8 +178,8 @@ class SyncStubTests(_StubPathCase):
 
     def test_stub_predating_the_stamp_format_is_rewritten(self):
         pathlib.Path(self.path).write_text('# volkano-stub: sha256=%s '
-                                           'header-version=359 source=main\n'
-                                           % _SHA_A, encoding='utf-8')
+                                           'header-version=359 source=%s\n'
+                                           % (_SHA_A, _URI_A), encoding='utf-8')
         self.assertIsNone(stub.read_stub_provenance(self.path))
         self.assertTrue(stub.sync_stub(self._registry(_SHA_A), path=self.path))
 
@@ -142,6 +202,41 @@ class SyncStubTests(_StubPathCase):
             with self.assertLogs('volkano.stub', level='WARNING'):
                 self.assertFalse(
                     stub.sync_stub(self._registry(_SHA_A), path=self.path))
+
+
+class StubIsStaleTests(_StubPathCase):
+    """The cheap check the facade runs on every build."""
+
+    def _registry(self, sha, uri=_URI_A):
+        return _FakeRegistry({'VK_FOO': 1},
+                             provenance=Provenance(sha, uri, 359))
+
+    def test_a_missing_stub_is_stale(self):
+        self.assertTrue(stub.stub_is_stale(self._registry(_SHA_A),
+                                           path=self.path))
+
+    def test_a_freshly_written_stub_is_not_stale(self):
+        stub.sync_stub(self._registry(_SHA_A), path=self.path)
+        self.assertFalse(stub.stub_is_stale(self._registry(_SHA_A),
+                                            path=self.path))
+
+    def test_changed_bytes_or_uri_go_stale(self):
+        stub.sync_stub(self._registry(_SHA_A), path=self.path)
+        self.assertTrue(stub.stub_is_stale(self._registry(_SHA_B),
+                                           path=self.path))
+        self.assertTrue(stub.stub_is_stale(self._registry(_SHA_A, _URI_B),
+                                           path=self.path))
+
+    def test_no_provenance_is_never_stale(self):
+        # An Element fixture has no identity to be out of date with.
+        self.assertFalse(stub.stub_is_stale(_FakeRegistry({'VK_FOO': 1}),
+                                            path=self.path))
+
+    def test_checking_never_writes(self):
+        with patch.object(stub, 'write_stub',
+                          side_effect=AssertionError('must not write')):
+            stub.stub_is_stale(self._registry(_SHA_A), path=self.path)
+        self.assertFalse(os.path.exists(self.path))
 
 
 class BuildRegistryLeavesStubAloneTests(_StubPathCase):

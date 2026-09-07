@@ -21,10 +21,11 @@ include = ["volkano*"]
 exclude = ["tests*"]
 
 # PEP 561 marker. Without it a type checker ignores __init__.pyi even
-# once it exists. The stub itself is generated on the user's machine
-# (on first import, or via `python -m volkano.stub`) rather than shipped,
-# because it describes whichever vk.xml that machine is actually built
-# against — so it is deliberately absent from the wheel.
+# once it exists. The stub itself is generated on the user's machine by
+# `python -m volkano update` rather than shipped, because it describes
+# whichever vk.xml that machine is actually built against — so it is
+# deliberately absent from the wheel. Importing volkano does not write
+# it; a stale or missing stub costs autocomplete and nothing else.
 [tool.setuptools.package-data]
 volkano = ["py.typed"]
 

@@ -15,6 +15,7 @@ from unittest.mock import patch
 from volkano import xml_parser as xp
 from volkano import xml_source
 from volkano.lazy import _Thunk
+from volkano.vulkan_stdlib import STDLIB, VkRegistry
 
 
 class _CacheDirCase(unittest.TestCase):
@@ -140,8 +141,50 @@ class LegacyEnumDialectTests(unittest.TestCase):
         self.assertEqual(target.args, ('SOMETHING_ELSEWHERE',))
 
 
-class IntegrityCheckTests(_CacheDirCase):
-    """A semver tag's patch component is its VK_HEADER_VERSION."""
+class EnumerantEntryTests(unittest.TestCase):
+    """Enumerants resolve through their group, not to a bare int."""
+
+    XML = ('<registry><enums name="VkFoo" type="enum">'
+           '<enum name="VK_FOO_A" value="0"/>'
+           '<enum name="VK_FOO_B" value="-3"/>'
+           '<enum name="VK_FOO_B_KHR" alias="VK_FOO_B"/>'
+           '</enums></registry>')
+
+    def _data(self):
+        return xp.XmlReader(ET.fromstring(self.XML)).run()
+
+    def test_enumerant_emits_a_group_referencing_call(self):
+        entry = self._data()['VK_FOO_B']
+        self.assertIsInstance(entry, _Thunk)
+        # (Force('enum_member'), Force('VkFoo'), name, value)
+        self.assertEqual(entry.fn.args, ('enum_member',))
+        self.assertEqual(entry.args[0].args, ('VkFoo',))
+        self.assertEqual(entry.args[1:], ('VK_FOO_B', -3))
+
+    def test_computed_value_rides_along_as_the_fallback(self):
+        self.assertEqual(self._data()['VK_FOO_B_KHR'].args[-1], -3)
+
+    def test_forcing_yields_the_member_itself(self):
+        r = VkRegistry({**STDLIB, **self._data()})
+        self.assertIs(r('VK_FOO_A'), r('VkFoo').VK_FOO_A)
+
+    def test_alias_forces_to_the_canonical_member(self):
+        r = VkRegistry({**STDLIB, **self._data()})
+        self.assertIs(r('VK_FOO_B_KHR'), r('VkFoo').VK_FOO_B)
+
+    def test_no_cycle_between_group_and_its_enumerants(self):
+        # The group and its members reference each other's entries; a
+        # cycle here would surface as the kernel's ValueError.
+        r = VkRegistry({**STDLIB, **self._data()})
+        self.assertEqual(int(r('VK_FOO_B')), -3)
+        self.assertEqual(len(r('VkFoo').__members__), 3)
+
+
+class ProvenanceTests(_CacheDirCase):
+    """The parser records VK_HEADER_VERSION; it no longer adjudicates it."""
+
+    URI = ('https://raw.githubusercontent.com/KhronosGroup/Vulkan-Docs'
+           '/refs/tags/v1.4.359/xml/vk.xml')
 
     XML = (b'<registry><types><type category="define">#define '
            b'<name>VK_HEADER_VERSION</name> {}</type></types></registry>')
@@ -151,34 +194,42 @@ class IntegrityCheckTests(_CacheDirCase):
             xml_source, '_download',
             return_value=self.XML.replace(b'{}', header_version))
 
-    def test_matching_header_version_passes(self):
+    def test_header_version_is_recorded(self):
         with self._serving(b'359'):
-            data, provenance = xp.parse_registry('tag:v1.4.359')
+            data, provenance = xp.parse_registry(self.URI)
         self.assertEqual(data['VK_HEADER_VERSION'], 359)
         self.assertEqual(provenance.header_version, 359)
 
-    def test_mismatched_header_version_raises(self):
-        with self._serving(b'42'):
-            with self.assertRaisesRegex(ValueError, 'VK_HEADER_VERSION'):
-                xp.parse_registry('tag:v1.4.359')
+    def test_provenance_carries_the_uri_it_was_fetched_from(self):
+        with self._serving(b'359'):
+            _, provenance = xp.parse_registry(self.URI)
+        self.assertEqual(provenance.uri, self.URI)
 
-    def test_a_branch_is_not_checked(self):
-        # A branch's version is whatever it says; nothing to compare to.
+    def test_the_uri_is_never_second_guessed(self):
+        # There was once a cross-check here: a semver-shaped tag name
+        # implied a VK_HEADER_VERSION, and disagreeing bytes raised. A
+        # URI-keyed cache has no name/content indirection left to guard
+        # — the entry is derived from the URI it came from — so the
+        # bytes are simply believed.
         with self._serving(b'42'):
-            data, _ = xp.parse_registry('main')
+            data, provenance = xp.parse_registry(self.URI)
         self.assertEqual(data['VK_HEADER_VERSION'], 42)
+        self.assertEqual(provenance.header_version, 42)
 
-    def test_non_semver_tags_are_not_checked(self):
-        # The '-core' and dated families carry no comparable component.
-        for ref in ('v1.0.33-core', 'v1.0-core+wsi-20160216'):
-            with self.subTest(ref=ref):
-                with self._serving(b'42'):
-                    xp.parse_registry('tag:' + ref)
-
-    def test_non_vulkan_api_is_not_checked(self):
-        # vulkansc carries an unrelated VK_HEADER_VERSION.
+    def test_every_api_is_treated_alike(self):
+        # vulkansc carries an unrelated VK_HEADER_VERSION. With nothing
+        # to compare it against, it needs no special case.
         with self._serving(b'22'):
-            xp.parse_registry('tag:v1.4.359', api='vulkansc')
+            _, provenance = xp.parse_registry(self.URI, api='vulkansc')
+        self.assertEqual(provenance.header_version, 22)
+
+    def test_an_element_still_has_no_provenance(self):
+        import xml.etree.ElementTree as ET
+        data, provenance = xp.parse_registry(
+            ET.fromstring(self.XML.replace(b'{}', b'359').decode()))
+        self.assertEqual(data['VK_HEADER_VERSION'], 359)
+        self.assertIsNone(provenance)
+
 
 if __name__ == '__main__':
     unittest.main()

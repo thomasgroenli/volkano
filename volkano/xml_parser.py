@@ -8,9 +8,9 @@ are re-exported from :mod:`volkano.lazy` and produce thunk
 objects rather than marker-prefixed lists.
 
 This module is the *schema* half. Everything about where the bytes come
-from — the source vocabulary, downloads, the on-disk cache, provenance
-— lives in :mod:`volkano.xml_source`, which knows Khronos's repository
-and nothing about Vulkan's schema. The split keeps this file testable
+from — URIs, downloads, the on-disk cache, provenance — lives in
+:mod:`volkano.xml_source`, which knows how to fetch bytes and nothing
+about Vulkan's schema. The split keeps this file testable
 against an in-memory Element with no notion of caching, and keeps that
 one testable with no notion of what a ``<type>`` means.
 
@@ -29,7 +29,7 @@ import xml.etree.ElementTree as ET
 from typing import Any
 
 from .lazy import Force, Call, Quote
-from .xml_source import Provenance, expected_header_version, load_xml, resolve_source
+from .xml_source import Provenance, load_xml
 
 
 # Parser-side logger. One DEBUG record per resolved fragment; the
@@ -597,18 +597,33 @@ class XmlReader:
                 self.output[name] = resolved
             else:
                 self.output[name] = payload
-        for members in self.group_members.values():
+        # Enumerants resolve to their group's member rather than to the
+        # bare integer, so ``vk.VK_SUCCESS is vk.VkResult.VK_SUCCESS``
+        # holds — see :func:`vulkan_stdlib.enum_member`. The computed
+        # integer rides along as the fallback, which also keeps the
+        # entry independently meaningful if the group can't be built.
+        #
+        # No cycle is introduced by the group reference. An enumerant
+        # entry forces its group, and the only thing a group forces back
+        # is the ``Force(malias)`` fallback in :meth:`_emit_enum_group` —
+        # reached solely when ``_resolve_chain`` found the alias target
+        # is *not* an enumerant anywhere, so it can never point into
+        # this loop's output.
+        for group, members in self.group_members.items():
             for mname, mval, malias in members:
                 if mname in self.output:
                     continue
                 if mval is not None:
-                    self.output[mname] = mval
+                    value = mval
                 elif malias is not None:
-                    resolved = self._resolve_chain(malias)
-                    if resolved is not None:
-                        self.output[mname] = resolved
-                    else:
+                    value = self._resolve_chain(malias)
+                    if value is None:
                         unresolved.append(mname)
+                        continue
+                else:
+                    continue
+                self.output[mname] = Call('enum_member',
+                                          [Force(group), mname, value])
         if unresolved:
             self.output['_unresolved_aliases'] = unresolved
 
@@ -643,7 +658,7 @@ def parse_registry(source: Any = None, *,
                    api: str = 'vulkan') -> tuple[dict[str, Any], Provenance | None]:
     """Convert a Vulkan XML registry to thunk-graph data, with provenance.
 
-    ``source`` takes the vocabulary of
+    ``source`` is a URI or path as understood by
     :func:`volkano.xml_source.resolve_source`, plus an
     :class:`~xml.etree.ElementTree.Element` for in-memory use.
     """
@@ -651,21 +666,13 @@ def parse_registry(source: Any = None, *,
     data = XmlReader(root, api=api).run()
     if provenance is None:
         return data, None
-    header_version = data.get('VK_HEADER_VERSION')
-    if api == 'vulkan':
-        # Cross-check the bytes against what the source's name claims.
-        # Only 'vulkan' — vulkansc carries an unrelated
-        # VK_HEADER_VERSION that would fire spuriously. What counts as a
-        # claim is xml_source's business; what VK_HEADER_VERSION means
-        # is ours.
-        src = resolve_source(source)
-        expected = expected_header_version(src)
-        if expected is not None and header_version != expected:
-            raise ValueError(
-                f"{src.path} claims to be {src.label} but declares "
-                f"VK_HEADER_VERSION {header_version!r}, not {expected}. "
-                f"Delete it and let volkano refetch.")
-    return data, provenance._replace(header_version=header_version)
+    # Recorded, not checked. There was once a cross-check here against
+    # the version a semver-shaped tag name implied, because a *name*
+    # could lie about the bytes filed under it. A URI-keyed cache has no
+    # such indirection to guard: the cache entry is derived from the URI
+    # it was fetched from, so there is no second claim to disagree with.
+    return data, provenance._replace(
+        header_version=data.get('VK_HEADER_VERSION'))
 
 
 def parse_xml(source: Any = None, *, api: str = 'vulkan') -> dict[str, Any]:

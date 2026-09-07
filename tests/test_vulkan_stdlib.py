@@ -11,6 +11,7 @@ from volkano.vulkan_stdlib import (
     ref, array,
     make_handle, make_basetype, make_bitmask, make_enum,
     make_funcpointer, make_struct, make_union, make_command,
+    enum_member,
 )
 
 
@@ -105,6 +106,28 @@ class EnumTests(unittest.TestCase):
                       values=(('A', 0), ('A_ALIAS', 0)))
         self.assertEqual(E.A, 0)
         self.assertEqual(E.A_ALIAS, E.A)
+
+
+class EnumMemberTests(unittest.TestCase):
+
+    def setUp(self):
+        self.group = make_enum(None, 'VkFoo', 'enum', 32,
+                               (('VK_FOO_A', 0),), (('VK_FOO_A_KHR', 'VK_FOO_A'),))
+
+    def test_returns_the_member(self):
+        self.assertIs(enum_member(self.group, 'VK_FOO_A', 0),
+                      self.group.VK_FOO_A)
+
+    def test_alias_returns_the_canonical_member(self):
+        self.assertIs(enum_member(self.group, 'VK_FOO_A_KHR', 0),
+                      self.group.VK_FOO_A)
+
+    def test_name_absent_from_the_group_falls_back_to_the_value(self):
+        self.assertEqual(enum_member(self.group, 'VK_FOO_MISSING', 7), 7)
+
+    def test_non_member_attribute_falls_back_to_the_value(self):
+        # 'name' resolves on the class but is not a member of it.
+        self.assertEqual(enum_member(self.group, 'name', 7), 7)
 
 
 class FuncpointerTests(unittest.TestCase):
@@ -203,6 +226,23 @@ class CommandTests(unittest.TestCase):
         sig = CommandSignature('vkAbsent', None, [], {})
         self.assertIsNone(sig.bind(_FakeDll([])))
         self.assertIsNone(sig._fn)
+
+    def test_enum_return_binds_a_decoding_restype(self):
+        R = make_enum(None, 'VkResultLike', 'enum', 32,
+                      (('VK_SUCCESS', 0), ('VK_ERROR_X', -3)), ())
+        sig = CommandSignature('vkEnumRet', R, [], {})
+        sig.bind(_FakeDll(['vkEnumRet']))
+        self.assertIs(sig._fn.restype(-3), R.VK_ERROR_X)
+
+    def test_scalar_return_binds_the_scalar_itself(self):
+        sig = CommandSignature('vkScalarRet', cbase.uint32, [], {})
+        sig.bind(_FakeDll(['vkScalarRet']))
+        self.assertIs(sig._fn.restype, cbase.uint32)
+
+    def test_void_return_binds_none(self):
+        sig = CommandSignature('vkVoidRet', None, [], {})
+        sig.bind(_FakeDll(['vkVoidRet']))
+        self.assertIsNone(sig._fn.restype)
 
     def test_command_binds_on_first_call_not_at_force(self):
         dll = _FakeDll(['vkAuto'])

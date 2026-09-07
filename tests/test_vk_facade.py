@@ -1,9 +1,9 @@
 """Tests for the volkano package facade.
 
 The facade is mode 2 (:func:`volkano.registry`) applied to environment
-variables, plus a module global and the stub sync. These tests pin that
-relationship: the environment reaches the registry *as arguments*, and
-nothing else in the package consults it.
+variables, plus a module global and a stub *check*. These tests pin
+that relationship: the environment reaches the registry *as arguments*,
+nothing else in the package consults it, and importing never writes.
 """
 from __future__ import annotations
 
@@ -22,16 +22,28 @@ class _FakeReg:
         return ['VkInstance', 'VkPhysicalDevice']
 
 
+_URI_A = ('https://raw.githubusercontent.com/KhronosGroup/Vulkan-Docs'
+          '/refs/tags/v1.4.359/xml/vk.xml')
+_URI_B = 'file:///work/vk.xml'
+
+
 def _patch_build(factory):
     return patch('volkano.vulkan_stdlib.build_registry', factory)
+
+
+def _reset():
+    """Clear the singleton and anything :func:`volkano.use` set."""
+    vk._registry = None
+    vk._source_override = vk._UNSET
+    vk._library_override = vk._UNSET
 
 
 class FacadeTests(unittest.TestCase):
     """The package keeps a module-global registry; reset around every test."""
 
     def setUp(self):
-        vk._registry = None
-        self.addCleanup(setattr, vk, '_registry', None)
+        _reset()
+        self.addCleanup(_reset)
 
     def test_attr_access_triggers_lazy_build_once(self):
         calls = {'n': 0}
@@ -67,29 +79,49 @@ class FacadeTests(unittest.TestCase):
             b = vk.get_registry()
         self.assertIs(a, b)
 
-    def test_stub_is_synced_once_after_the_registry_is_published(self):
+    def test_import_never_writes_the_stub(self):
+        # Generating it forces every entry and writes a megabyte into
+        # the installed package; `python -m volkano update` owns that.
+        with _patch_build(lambda *a, **kw: _FakeReg()):
+            with patch.object(stub, 'sync_stub',
+                              side_effect=AssertionError('must not sync')):
+                with patch.object(stub, 'write_stub',
+                                  side_effect=AssertionError('must not write')):
+                    vk.VK_FOO
+                    vk.VK_FOO
+
+    def test_a_stale_stub_is_reported_once_and_names_the_command(self):
         seen = {}
 
-        def fake_sync(registry, **kw):
-            # Publishing before syncing is what stops a re-entrant
-            # attribute access during the (slow) sync from starting a
-            # second build.
+        def fake_stale(registry, **kw):
+            # Checked after publishing, so a re-entrant attribute access
+            # from anything it touches finds the singleton rather than
+            # starting a second build.
             seen['published'] = vk._registry is registry
-            return False
+            return True
 
         with _patch_build(lambda *a, **kw: _FakeReg()):
-            with patch.object(stub, 'sync_stub', fake_sync):
-                vk.VK_FOO
-                vk.VK_FOO
+            with patch.object(stub, 'stub_is_stale', fake_stale):
+                with self.assertLogs('volkano', level='INFO') as logs:
+                    vk.VK_FOO
+                    vk.VK_FOO
         self.assertTrue(seen['published'])
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn('python -m volkano update', logs.output[0])
+
+    def test_a_broken_stub_check_never_sinks_the_import(self):
+        with _patch_build(lambda *a, **kw: _FakeReg()):
+            with patch.object(stub, 'stub_is_stale',
+                              side_effect=OSError('read-only')):
+                self.assertEqual(vk.VK_FOO, 42)
 
 
 class EnvironmentTests(unittest.TestCase):
     """``get_registry`` is the only reader of VOLKANO_XML / VOLKANO_LIBRARY."""
 
     def setUp(self):
-        vk._registry = None
-        self.addCleanup(setattr, vk, '_registry', None)
+        _reset()
+        self.addCleanup(_reset)
 
     def _captured_kwargs(self, env):
         """Build the singleton under exactly ``env`` and report the call.
@@ -112,7 +144,7 @@ class EnvironmentTests(unittest.TestCase):
 
     def test_unset_means_main_and_autodetect(self):
         captured = self._captured_kwargs({})
-        self.assertIsNone(captured['source'])       # -> resolve_source -> main
+        self.assertIsNone(captured['source'])       # -> resolve_source -> DEFAULT_URI
         self.assertIs(captured['library'], True)    # -> autodetect
 
     def test_blank_is_treated_as_unset(self):
@@ -124,8 +156,8 @@ class EnvironmentTests(unittest.TestCase):
         self.assertIs(captured['library'], True)
 
     def test_xml_var_is_passed_through_as_the_source(self):
-        captured = self._captured_kwargs({'VOLKANO_XML': '1.4.359'})
-        self.assertEqual(captured['source'], '1.4.359')
+        captured = self._captured_kwargs({'VOLKANO_XML': _URI_A})
+        self.assertEqual(captured['source'], _URI_A)
 
     def test_library_var_is_passed_through_as_a_path(self):
         captured = self._captured_kwargs(
@@ -140,10 +172,10 @@ class EnvironmentTests(unittest.TestCase):
         # Both values are set long after `import volkano` ran, and both
         # take effect — so there is no "configure before first access"
         # ordering rule to trip over.
-        first = self._captured_kwargs({'VOLKANO_XML': '1.4.300'})
-        second = self._captured_kwargs({'VOLKANO_XML': '1.4.359'})
-        self.assertEqual(first['source'], '1.4.300')
-        self.assertEqual(second['source'], '1.4.359')
+        first = self._captured_kwargs({'VOLKANO_XML': _URI_B})
+        second = self._captured_kwargs({'VOLKANO_XML': _URI_A})
+        self.assertEqual(first['source'], _URI_B)
+        self.assertEqual(second['source'], _URI_A)
 
 
 class ModeTwoIsolationTests(unittest.TestCase):
@@ -152,8 +184,8 @@ class ModeTwoIsolationTests(unittest.TestCase):
     EMPTY_XML = ET.fromstring('<registry/>')
 
     def setUp(self):
-        vk._registry = None
-        self.addCleanup(setattr, vk, '_registry', None)
+        _reset()
+        self.addCleanup(_reset)
 
     def test_registry_does_not_populate_the_singleton(self):
         built = vk.registry(self.EMPTY_XML)
@@ -168,7 +200,7 @@ class ModeTwoIsolationTests(unittest.TestCase):
                 vk.registry(self.EMPTY_XML)
 
     def test_registry_ignores_the_environment(self):
-        with patch.dict('os.environ', {'VOLKANO_XML': '1.4.359'}, clear=False):
+        with patch.dict('os.environ', {'VOLKANO_XML': _URI_A}, clear=False):
             captured = {}
 
             def fake_build(source=None, *, library=None, **kw):
@@ -179,6 +211,65 @@ class ModeTwoIsolationTests(unittest.TestCase):
                 vk.registry()
         self.assertIsNone(captured['source'])
         self.assertIsNone(captured['library'])
+
+
+class UseTests(unittest.TestCase):
+    """``use()`` is the in-process equivalent of the environment."""
+
+    def setUp(self):
+        _reset()
+        self.addCleanup(_reset)
+
+    def _captured(self, env=None):
+        captured = {}
+
+        def fake_build(source=None, *, library=None, **kw):
+            captured.update(source=source, library=library)
+            return _FakeReg()
+
+        with patch.dict('os.environ', env or {}, clear=True):
+            with _patch_build(fake_build):
+                vk.get_registry()
+        return captured
+
+    def test_use_supplies_the_source(self):
+        vk.use(_URI_A)
+        self.assertEqual(self._captured()['source'], _URI_A)
+
+    def test_use_beats_the_environment(self):
+        vk.use(_URI_A)
+        self.assertEqual(self._captured({'VOLKANO_XML': _URI_B})['source'],
+                         _URI_A)
+
+    def test_use_none_means_the_default_and_still_beats_the_environment(self):
+        # An explicit None is a choice, not an absence.
+        vk.use(None)
+        self.assertIsNone(self._captured({'VOLKANO_XML': _URI_B})['source'])
+
+    def test_an_unspecified_argument_is_left_alone(self):
+        vk.use(library=None)
+        captured = self._captured({'VOLKANO_XML': _URI_B})
+        self.assertEqual(captured['source'], _URI_B)   # env still consulted
+        self.assertIsNone(captured['library'])
+
+    def test_calling_after_the_build_raises_rather_than_no_ops(self):
+        with _patch_build(lambda *a, **kw: _FakeReg()):
+            vk.VK_FOO
+        with self.assertRaisesRegex(RuntimeError, 'already been built'):
+            vk.use(_URI_A)
+
+    def test_registry_still_ignores_use(self):
+        # Mode 2 has no ambient inputs, and use() is an ambient input.
+        vk.use(_URI_A)
+        captured = {}
+
+        def fake_build(source=None, *, library=None, **kw):
+            captured.update(source=source)
+            return _FakeReg()
+
+        with _patch_build(fake_build):
+            vk.registry()
+        self.assertIsNone(captured['source'])
 
 
 if __name__ == '__main__':

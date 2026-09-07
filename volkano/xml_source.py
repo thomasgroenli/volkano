@@ -1,27 +1,33 @@
-"""Where a Vulkan XML registry comes from: vocabulary, fetch, cache.
+"""Where a Vulkan XML registry comes from: URI, fetch, cache.
 
 This module answers "which bytes, and from where", and hands back a
-document plus the identity of what it read. It knows about Khronos's
-repository — branch and tag refs, the layout move from ``src/spec/`` to
-``xml/`` — and nothing whatsoever about Vulkan's schema.
+document plus the identity of what it read. It knows how to fetch a URI
+and how to cache one, and nothing whatsoever about Vulkan's schema.
 :mod:`volkano.xml_parser` is the other half: given a document, produce
 the thunk graph. Keeping them apart means the parser is testable
 against an in-memory Element with no notion of caching, and this module
 is testable with no notion of what a ``<type>`` means.
 
-The source vocabulary is closed and prefix-tagged, so nothing is ever
-inferred from the shape of a string:
+A source is a **URI** — or a filesystem path, which is one spelled
+without ceremony:
 
-- ``None`` / ``'main'`` — the Khronos main branch (mutable)
-- ``'branch:<name>'`` — that branch head (mutable)
-- ``'tag:<name>'`` — that tag, verbatim (immutable)
-- anything else — a local filesystem path (never cached)
+- ``None`` — :data:`DEFAULT_URI`, Khronos's main branch.
+- ``https://…`` / ``http://…`` — fetched once and cached forever.
+- ``file://…`` — read in place, never cached.
+- anything else — a filesystem path, resolved and read in place.
 
-Two rules earn their keep repeatedly. Tag names pass through
-**verbatim** rather than being rebuilt from a version number, because
-rebuilding is inference about Khronos's naming history and is wrong for
-89 of the 382 published tags. And repo layouts are *tried*, not
-predicted: a 404 is an observation, a tag name is not evidence.
+There is no vocabulary to learn beyond that, and volkano knows nothing
+about Khronos's repository past the one default URI: no tag naming
+scheme, no branch namespace, no directory layout. Pinning a release
+means naming the URL of that release's ``vk.xml`` — the identifier
+GitHub already gives you, which stays correct across the layout move
+from ``src/spec/`` to ``xml/`` and across all three of the tag-naming
+families Khronos has used.
+
+Nothing is ever revalidated. A URI is fetched when it is missing from
+the cache and at no other time, so a normal import does no network I/O
+whatever the source is. ``python -m volkano update`` is the one thing
+that refetches.
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ import os
 import pathlib
 import re
 import tempfile
-import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any, NamedTuple
@@ -51,119 +57,117 @@ logger = logging.getLogger('volkano.source')
 #: its arguments.
 ENV_VAR = 'VOLKANO_XML'
 
-_RAW_ROOT = 'https://raw.githubusercontent.com/KhronosGroup/Vulkan-Docs'
+#: The default source: Khronos's main branch. The newest published API
+#: surface — but note it is the *branch*, not the newest release: it
+#: runs ahead of the tags and can carry provisional extensions. Name a
+#: tag's URL instead if you need reproducibility.
+#:
+#: This constant is the only thing in volkano that knows anything about
+#: Khronos's repository, and it knows exactly one URL rather than a
+#: scheme for building them.
+DEFAULT_URI = ('https://raw.githubusercontent.com/KhronosGroup/Vulkan-Docs'
+               '/refs/heads/main/xml/vk.xml')
 
-#: Where vk.xml lives inside the repo, newest layout first. Khronos
-#: moved it from ``src/spec/`` to ``xml/`` between v1.1.70 and v1.2.131,
-#: so old tags 404 on the modern path. Candidates are *tried*, not
-#: inferred from the ref name — a 404 is an observation, whereas
-#: guessing the layout from a tag would be the same mistake as
-#: reconstructing the tag from a version.
-_REPO_XML_PATHS = ('xml/vk.xml', 'src/spec/vk.xml')
+#: Schemes we fetch. Everything else is rejected by name rather than
+#: attempted and failed, so ``ftp://`` gets a sentence instead of a
+#: :class:`~urllib.error.URLError` from three frames down.
+_FETCHABLE_SCHEMES = ('http', 'https')
 
-_REF_URL = _RAW_ROOT + '/refs/{kind}s/{ref}/{path}'
-
-#: Default branch. The newest published API surface — but note it is the
-#: *branch*, not the newest release: it runs ahead of the tags and can
-#: carry provisional extensions. Pin a tag if you need reproducibility.
-DEFAULT_BRANCH = 'main'
-MAIN_URL = _REF_URL.format(kind='head', ref=DEFAULT_BRANCH,
-                           path=_REPO_XML_PATHS[0])
-
-#: Tag names are passed through **verbatim**. Reconstructing them from a
-#: parsed version looks like construction but is really inference about
-#: Khronos's naming history, and it is wrong for 89 of the 382 published
-#: tags: plain ``vX.Y.Z`` only starts at v1.1.70, and everything older
-#: uses ``v1.0.33-core`` or ``v1.0-core+wsi-20160216``. ``v1.0.33`` has
-#: never existed. The tag *is* the identifier; don't rebuild it.
-_PREFIXES = {'tag:': 'tag', 'branch:': 'head'}
-
-#: Only a tag shaped exactly like this can be cross-checked against
-#: VK_HEADER_VERSION. The dated and ``-core`` families carry no
-#: comparable patch component, so the check opts in rather than assuming.
-_SEMVER_TAG_RE = re.compile(r'^v(\d+)\.(\d+)\.(\d+)$')
+#: A scheme needs **two or more** characters before ``://``. One would
+#: match the ``C`` of ``C://weird/but/legal``, and a Windows drive
+#: letter must never be read as a scheme. Ordinary ``C:\\…`` has no
+#: ``//`` and so never reaches this at all.
+_SCHEME_RE = re.compile(r'^([A-Za-z][A-Za-z0-9+.\-]+)://')
 
 _UNSAFE_IN_FILENAME_RE = re.compile(r'[^A-Za-z0-9._+-]')
 _USER_AGENT = 'volkano/0.1 (+https://github.com/KhronosGroup/Vulkan-Docs)'
 
+#: How much of a URI to keep in its cache filename. Long enough that
+#: the tail of a raw.githubusercontent URL still names the ref, short
+#: enough to stay well inside every filesystem's limit once the digest
+#: is appended.
+_CACHE_NAME_CHARS = 56
+
 
 class XmlSource(NamedTuple):
-    """A resolved source: what to parse, and where it is cached."""
+    """A resolved source: what to read, and where it lives locally."""
 
-    kind: str                    # 'branch' | 'tag' | 'path'
-    label: str                   # 'main' | 'v1.0.33-core' | abs path
-    urls: tuple[str, ...]        # candidate URLs; empty for a local path
+    uri: str                     # 'https://…' or 'file:///…'
     path: pathlib.Path           # cache entry, or the file itself
-    ref: str | None              # branch or tag name; None for a path
 
     @property
-    def url(self) -> str | None:
-        """The preferred URL — the modern repo layout."""
-        return self.urls[0] if self.urls else None
+    def local(self) -> bool:
+        """Whether the bytes already sit on disk under the user's control.
 
-    @property
-    def mutable(self) -> bool:
-        """Whether re-fetching this source could ever change anything.
-
-        Structural, not inferred: a branch head moves, a tag does not.
+        A local file is read in place and never copied into the cache:
+        caching a path would only add a second, staler copy of a file
+        the user can already edit.
         """
-        return self.kind == 'branch'
+        return self.uri.startswith('file:')
 
 
 class Provenance(NamedTuple):
     """Identity of the XML a registry was actually built from.
 
     ``sha256`` is what :func:`volkano.stub.sync_stub` compares against
-    the stamp in an existing stub. ``label`` is compared alongside it so
-    that switching between ``main`` and a local file still regenerates
-    even in the pathological case where the bytes match.
+    the stamp in an existing stub. ``uri`` is compared alongside it so
+    that switching between two sources still regenerates even in the
+    pathological case where the bytes match — and unlike a bare label, a
+    URI is absolute, so it still means the same thing when the stamp is
+    read back from a different working directory tomorrow.
+
+    ``header_version`` is the odd one out: it is filled in by
+    :func:`volkano.xml_parser.parse_registry` once the document has
+    actually been read, because knowing what ``VK_HEADER_VERSION`` means
+    is the parser's job, not this module's. It is ``None`` on the
+    instance :func:`load_xml` returns.
     """
 
     sha256: str
-    label: str
+    uri: str
     header_version: int | None
-    url: str | None
 
 
-def _ref_urls(url_kind: str, ref: str) -> tuple[str, ...]:
-    """Candidate URLs for one ref, newest repo layout first."""
-    return tuple(_REF_URL.format(kind=url_kind, ref=ref, path=path)
-                 for path in _REPO_XML_PATHS)
+def _cache_filename(uri: str) -> str:
+    """A legible, collision-free cache filename for one URI.
 
-
-def _cache_filename(kind: str, ref: str) -> str:
-    """A legible, collision-free cache filename for one ref.
-
-    Refs may contain characters a filename can't (``feature/foo``) or
-    that merely look odd (``v1.0-core+wsi-20160216``). Sanitising alone
-    would let ``a/b`` and ``a-b`` collide and silently serve the wrong
-    XML, so a short digest of the original is appended whenever
-    sanitising actually changed something. Well-behaved refs — which is
-    nearly all of them — keep a clean name.
+    The digest is what makes it correct — two URIs can differ only in
+    characters a filename cannot hold — and the sanitised tail is what
+    makes an ``ls`` of the cache directory readable. The tail is never
+    load-bearing, so truncating it costs nothing.
     """
-    safe = _UNSAFE_IN_FILENAME_RE.sub('-', ref)
-    if safe != ref:
-        safe = f'{safe}-{hashlib.sha1(ref.encode("utf-8")).hexdigest()[:8]}'
-    return f'{kind}-{safe}.xml'
+    tail = _UNSAFE_IN_FILENAME_RE.sub('-', uri.split('://', 1)[-1])
+    tail = tail[-_CACHE_NAME_CHARS:].strip('-.')
+    if tail.endswith('.xml'):
+        tail = tail[:-4].strip('-.')
+    digest = hashlib.sha256(uri.encode('utf-8')).hexdigest()[:12]
+    return f'{tail}-{digest}.xml' if tail else f'{digest}.xml'
+
+
+def _local_source(path: pathlib.Path) -> XmlSource:
+    """A source read in place: absolute, symlink-free, never cached.
+
+    Resolving matters for more than tidiness. The URI goes into the
+    stub's provenance stamp, and a relative path would record an
+    identity that means something different depending on where the
+    interpreter was started — regenerating the stub on nothing more
+    than a ``cd``.
+    """
+    path = path.expanduser().resolve()
+    return XmlSource(path.as_uri(), path)
 
 
 def resolve_source(source: str | None = None) -> XmlSource:
-    """Resolve a source string to a URL and a cache location.
+    """Resolve a source to a URI and the local path holding its bytes.
 
-    The vocabulary is closed and prefix-tagged, so nothing has to be
-    inferred from the shape of a string:
+    - ``None`` (or blank) — :data:`DEFAULT_URI`.
+    - ``https://…`` / ``http://…`` — cached under :func:`cache_dir`.
+    - ``file://…`` — that file, read in place.
+    - anything else — a filesystem path, read in place.
 
-    - ``None`` or ``'main'`` — the Khronos main branch (mutable).
-    - ``'branch:<name>'`` — that branch head (mutable).
-    - ``'tag:<name>'`` — that tag, verbatim (immutable; never refetched
-      once cached). ``tag:v1.4.359``, ``tag:v1.0.33-core``,
-      ``tag:v1.0-core+wsi-20160216`` all work.
-    - anything else — a local filesystem path, never cached.
-
-    Arbitrary URLs are rejected. A cached URL is just a local file with
-    extra steps, and the one case where a URL genuinely beats a path — a
-    source that moves — is exactly the case caching breaks. Download it
-    yourself and pass the path.
+    Pure: it reads no environment and touches no filesystem, so
+    resolving a source has no side effect and two calls with the same
+    argument are indistinguishable.
     """
     # Empty and whitespace-only count as "unspecified", not as the
     # current directory. `VOLKANO_XML=` (a declared-but-blank CI
@@ -172,52 +176,30 @@ def resolve_source(source: str | None = None) -> XmlSource:
     # baffling PermissionError.
     source = str(source).strip() if source is not None else ''
     if not source:
-        source = DEFAULT_BRANCH
-    if '://' in source:
+        source = DEFAULT_URI
+
+    match = _SCHEME_RE.match(source)
+    scheme = match.group(1).lower() if match else None
+
+    if scheme in _FETCHABLE_SCHEMES:
+        return XmlSource(source, cache_dir() / _cache_filename(source))
+    if scheme == 'file':
+        parts = urllib.parse.urlsplit(source)
+        if parts.netloc and parts.netloc.lower() != 'localhost':
+            raise ValueError(
+                f'{source!r} names the host {parts.netloc!r}; volkano reads '
+                f'file:// URIs from the local filesystem only.')
+        # url2pathname is what turns '/C:/x' back into 'C:\\x' on
+        # Windows and undoes percent-encoding everywhere.
+        return _local_source(
+            pathlib.Path(urllib.request.url2pathname(parts.path)))
+    if scheme is not None:
         raise ValueError(
-            f"{source!r} looks like a URL, which is not an accepted source. "
-            f"Use 'main', 'tag:<name>', 'branch:<name>', or a path to a "
-            f"local vk.xml (download the URL yourself if you need a "
-            f"bespoke one).")
+            f'{source!r} uses the {scheme!r} scheme, which volkano does not '
+            f'fetch. Use an http(s) URL, a file:// URI, or a path to a local '
+            f'vk.xml (download it yourself if it lives somewhere else).')
 
-    prefix = next((p for p in _PREFIXES if source.startswith(p)), None)
-    if prefix is not None:
-        ref = source[len(prefix):].strip().strip('/')
-        if not ref:
-            raise ValueError(f"{source!r} names no ref after {prefix!r}.")
-        url_kind = _PREFIXES[prefix]
-        kind = 'tag' if url_kind == 'tag' else 'branch'
-        return XmlSource(kind, ref, _ref_urls(url_kind, ref),
-                         cache_dir() / _cache_filename(kind, ref), ref)
-
-    if source == DEFAULT_BRANCH:
-        # The one bare word, because it is also the default. Everything
-        # else must say which namespace it means.
-        return XmlSource('branch', DEFAULT_BRANCH, _ref_urls('head', DEFAULT_BRANCH),
-                         cache_dir() / _cache_filename('branch', DEFAULT_BRANCH),
-                         DEFAULT_BRANCH)
-
-    path = pathlib.Path(source).expanduser()
-    return XmlSource('path', str(path), (), path, None)
-
-
-def expected_header_version(src: XmlSource) -> int | None:
-    """The ``VK_HEADER_VERSION`` a tag's name implies, if it implies one.
-
-    A semver-shaped tag's patch component *is* the header version
-    (``v1.4.359`` -> 359), which makes a cheap cross-check that the
-    cache entry is what its name claims. Returns ``None`` for branches,
-    paths, and the older ``-core`` / dated tag families, which carry no
-    comparable component — the check opts in rather than assuming.
-
-    Tag-naming knowledge lives here rather than in the parser: the
-    parser knows what ``VK_HEADER_VERSION`` means, this module knows
-    what a tag name means.
-    """
-    if src.kind != 'tag' or src.ref is None:
-        return None
-    match = _SEMVER_TAG_RE.match(src.ref)
-    return int(match.group(3)) if match else None
+    return _local_source(pathlib.Path(source))
 
 
 def cache_dir() -> pathlib.Path:
@@ -256,32 +238,13 @@ def _write_atomic(path: pathlib.Path, data: bytes) -> None:
         raise
 
 
-def _download(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={'User-Agent': _USER_AGENT})
-    logger.info('fetching %s', url)
+def _download(uri: str) -> bytes:
+    req = urllib.request.Request(uri, headers={'User-Agent': _USER_AGENT})
+    logger.info('fetching %s', uri)
     with urllib.request.urlopen(req, timeout=30) as resp:
         data = resp.read()
     logger.info('fetched %d bytes', len(data))
     return data
-
-
-def _download_any(urls: tuple[str, ...]) -> bytes:
-    """Try each candidate URL in turn; return the first that exists.
-
-    Only a 404 advances to the next candidate — that means "this repo
-    layout, not that one". Any other error (offline, 500, timeout) is
-    about the request rather than the path, so it propagates
-    immediately instead of being retried against a URL that is even
-    less likely to work.
-    """
-    for index, url in enumerate(urls):
-        try:
-            return _download(url)
-        except urllib.error.HTTPError as exc:
-            if exc.code != 404 or index == len(urls) - 1:
-                raise
-            logger.debug('%s is not there (404); trying the older layout', url)
-    raise ValueError('no candidate URLs to try')
 
 
 def ensure_cached(src: XmlSource, *, refresh: bool = False) -> pathlib.Path:
@@ -291,37 +254,33 @@ def ensure_cached(src: XmlSource, *, refresh: bool = False) -> pathlib.Path:
     network traffic happens during a normal import. A *missing* entry is
     still fetched; "no revalidation" is not "never fetch".
     """
-    if src.kind == 'path':
+    if src.local:
         if not src.path.exists():
-            hint = ''
-            if _SEMVER_TAG_RE.match(src.label.strip()) or re.match(
-                    r'^\d+\.\d+\.\d+$', src.label.strip()):
-                # Almost certainly someone reaching for a release.
-                ref = src.label.strip()
-                hint = (f" (to pin a release, write 'tag:"
-                        f"{ref if ref.startswith('v') else 'v' + ref}')")
-            raise FileNotFoundError(f'no such vk.xml: {src.path}{hint}')
+            raise FileNotFoundError(
+                f'no such vk.xml: {src.path} (a source is a filesystem path '
+                f'or an http(s)/file URI; to pin a Khronos release, name the '
+                f'raw URL of that release\'s vk.xml)')
         return src.path
     if src.path.exists() and not refresh:
         logger.debug('using cached %s', src.path)
         return src.path
-    _write_atomic(src.path, _download_any(src.urls))
+    _write_atomic(src.path, _download(src.uri))
     return src.path
 
 
 def refresh_source(src: XmlSource) -> str:
-    """Redownload ``src`` if that can possibly change anything.
+    """Redownload ``src``, reporting what changed as a short status word.
 
-    Returns a short status word for the CLI to print. A tag is immutable
-    by construction, so refreshing one is a no-op — but only once it
-    exists; a cold cache still fetches.
+    Unconditional, because a URI carries no evidence about whether what
+    it names can move: a tag's URL and a branch's URL are the same
+    shape. Rather than guess, volkano never revalidates on its own and
+    always refetches when explicitly told to — the cost of being wrong
+    is one request the caller asked for.
     """
-    if src.kind == 'path':
+    if src.local:
         return 'local'
-    if not src.mutable and src.path.exists():
-        return 'pinned'
     before = src.path.read_bytes() if src.path.exists() else None
-    data = _download_any(src.urls)
+    data = _download(src.uri)
     _write_atomic(src.path, data)
     if before is None:
         return 'fetched'
@@ -344,14 +303,14 @@ def load_xml(source: Any = None) -> tuple[ET.Element, Provenance | None]:
     try:
         root = ET.fromstring(data)
     except ET.ParseError:
-        if src.kind == 'path':
+        if src.local:
             raise
-        # A cache entry we own failed to parse — most likely a download
-        # interrupted before atomic writes existed. Discard and refetch
-        # once; a second failure is real and propagates.
+        # A cache entry we own failed to parse — a download interrupted
+        # before atomic writes existed, or a captive portal that served
+        # a login page with a 200. Discard and refetch once; a second
+        # failure is real and propagates.
         logger.warning('cached %s did not parse; refetching', path)
         path = ensure_cached(src, refresh=True)
         data = path.read_bytes()
         root = ET.fromstring(data)
-    return root, Provenance(hashlib.sha256(data).hexdigest(), src.label,
-                            None, src.url)
+    return root, Provenance(hashlib.sha256(data).hexdigest(), src.uri, None)

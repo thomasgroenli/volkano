@@ -20,7 +20,7 @@ from volkano.cbase import (
     int8, int16, int32, int64,
     uint8, uint16, uint32, uint64,
     float32, float64,
-    Enum, friendly, _ENUM_SCALARS,
+    Enum, friendly, decoder, _ENUM_SCALARS,
 )
 
 
@@ -314,6 +314,42 @@ class FriendlyTests(unittest.TestCase):
 
     def test_none_passes_through(self):
         self.assertIsNone(friendly(None))
+
+
+class DecoderTests(unittest.TestCase):
+
+    def test_int_backed_enum_decodes_to_member(self):
+        E = Enum.create('DecReg', values=[('A', 0), ('B', -3)])
+        self.assertIs(decoder(E)(-3), E.B)
+
+    def test_unknown_value_passes_through_as_int(self):
+        E = Enum.create('DecUnknown', values=[('A', 0)])
+        got = decoder(E)(999)
+        self.assertEqual(got, 999)
+        self.assertNotIsInstance(got, enum.Enum)
+
+    def test_alias_decodes_to_primary_member(self):
+        E = Enum.create('DecAlias', values=[('A', 0)], aliases=[('A_KHR', 'A')])
+        self.assertIs(decoder(E)(0), E.A)
+
+    def test_decoder_is_memoised_per_class(self):
+        E = Enum.create('DecMemo', values=[('A', 0)])
+        self.assertIs(decoder(E), decoder(E))
+
+    def test_unsigned_flag_is_not_decodable(self):
+        # uint32-backed: ctypes would sign-extend a bit-31 member.
+        F = Enum.create('DecFlag', values=[('X', 1)], flag=True)
+        self.assertIsNone(decoder(F))
+
+    def test_unregistered_enum_is_not_decodable(self):
+        class U(enum.IntEnum):
+            X = 0
+        self.assertIsNone(decoder(U))
+
+    def test_non_enum_is_not_decodable(self):
+        self.assertIsNone(decoder(int32))
+        self.assertIsNone(decoder(ctypes.c_int))
+        self.assertIsNone(decoder(None))
 
 
 class StructLayoutTests(unittest.TestCase):

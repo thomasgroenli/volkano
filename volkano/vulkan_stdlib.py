@@ -10,7 +10,7 @@ all in the host:
   (~500-line template-evaluation language). Storage is mutable, no
   ``freeze()`` pass at construction.
 - :func:`build_registry` has diverged: it takes volkano's own source
-  vocabulary (see :func:`volkano.xml_source.resolve_source`), defers
+  URI or path (see :func:`volkano.xml_source.resolve_source`), defers
   opening the Vulkan loader to the first command *call*, and records the
   provenance of the XML it parsed. It has no ``refresh`` parameter and
   no knowledge of the ``.pyi`` stub.
@@ -24,6 +24,7 @@ import sys
 
 from .cbase import (
     Handle, Enum, FunctionPointer, Pointer, Array, Struct, Union, friendly,
+    decoder,
     char,
     int8, uint8, int16, uint16, int32, uint32, int64, uint64,
     float32, float64, size,
@@ -173,6 +174,30 @@ def make_enum(registry, name, kind='enum', bitwidth=32, values=(),
                        bitwidth=bitwidth, flag=(kind == 'bitmask'))
 
 
+def enum_member(group, name, value):
+    """One enumerant as a top-level entry — the member, not the bare int.
+
+    ``vk.VK_SUCCESS`` and ``vk.VkResult.VK_SUCCESS`` used to be two
+    different objects: the group built an ``IntEnum``, while the
+    enumerant emitted alongside it was a plain ``int``. They compared
+    equal, so the seam only showed up under ``is`` — which is exactly
+    how one reaches for an enum member, and now that commands *return*
+    members (see :func:`cbase.decoder`) the temptation is real.
+
+    ``group`` is the forced enum class, so this is where an enumerant
+    entry ends up depending on its group; ``value`` is the integer the
+    XML computed, kept as the fallback for a name the class doesn't
+    carry (an ``api``-filtered enumerant, an alias whose target didn't
+    survive). The ``isinstance`` check is what distinguishes "member"
+    from "attribute that merely exists" — an alias resolves through it
+    to the canonical member, which is the point.
+    """
+    member = getattr(group, name, None)
+    if isinstance(member, group):
+        return member
+    return value
+
+
 def make_funcpointer(registry, name, rettype, params=()):
     """``<type category="funcpointer">`` — typedef'd C function pointer.
 
@@ -290,7 +315,15 @@ class CommandSignature:
             self._unbound = self.NOT_EXPORTED
             return None
         fn.argtypes = tuple(friendly(p[1]) for p in self.params)
-        fn.restype = friendly(self.rettype) if self.rettype is not None else None
+        # ``decoder`` wins where it applies (VkResult, and nothing else
+        # in the registry today): ``friendly`` alone would hand back the
+        # backing scalar, so vkCreateInstance's failure arrived as
+        # ``int32(-3)`` rather than as
+        # ``VkResult.VK_ERROR_INITIALIZATION_FAILED``. ctypes takes a
+        # plain callable in the restype slot and feeds it the returned C
+        # int, which costs a fraction of what the equivalent ``errcheck``
+        # hop would, and skips building the scalar wrapper nobody wanted.
+        fn.restype = decoder(self.rettype) or friendly(self.rettype)
         self._fn = fn
         logger.debug('bound %s', self.name)
         return fn
@@ -523,8 +556,8 @@ def _default_library_path():
 def build_registry(source=None, *, library=None, api='vulkan'):
     """Construct a :class:`VkRegistry` from a Vulkan XML registry.
 
-    - ``source`` is ``None`` / ``'main'`` (Khronos main branch), a
-      version like ``'1.4.359'``, a filesystem path, or an
+    - ``source`` is ``None`` (Khronos's main branch), an http(s) URL,
+      a ``file://`` URI, a filesystem path, or an
       :class:`xml.etree.ElementTree.Element`. See
       :func:`volkano.xml_source.resolve_source`.
     - ``library`` is the loader spec — ``None`` (attach nothing),
@@ -532,10 +565,10 @@ def build_registry(source=None, *, library=None, api='vulkan'):
       opened: see :meth:`VkRegistry._ensure_library`.
 
     This module deliberately knows nothing about the ``.pyi`` stub.
-    Keeping the stub out of the build path is what makes "a registry you
-    construct yourself never writes to your source tree" a structural
-    property rather than a flag a caller could get wrong — only the
-    package facade syncs the stub, via :func:`volkano.stub.sync_stub`.
+    Keeping the stub out of the build path is what makes "building a
+    registry never writes to your source tree" a structural property
+    rather than a flag a caller could get wrong — the stub is written
+    by ``python -m volkano update`` and by nothing else.
     """
     from .xml_parser import parse_registry
     import time
@@ -563,6 +596,7 @@ STDLIB.update({
     'make_basetype':    make_basetype,
     'make_bitmask':     make_bitmask,
     'make_enum':        make_enum,
+    'enum_member':      enum_member,
     'make_funcpointer': make_funcpointer,
     'make_struct':      make_struct,
     'make_union':       make_union,
