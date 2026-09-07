@@ -1,0 +1,10 @@
+# The sdist file list is built from the working tree, not from git, so a
+# generated __init__.pyi sitting next to the package would be swept in
+# and the sdist for one commit would differ between machines. Exclude it
+# here; the wheel is covered by exclude-package-data in pyproject.toml.
+exclude volkano/__init__.pyi
+
+# Tests ship, and have to ship runnable: setuptools finds *.py under
+# tests/ on its own but not the dunder files that make it a package.
+include tests/__init__.py
+include tests/__main__.py

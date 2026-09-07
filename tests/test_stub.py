@@ -188,6 +188,25 @@ class SyncStubTests(_StubPathCase):
                                         path=self.path))
         self.assertFalse(os.path.exists(self.path))
 
+    def test_a_matching_stamp_forces_nothing(self):
+        # The facade runs this on every build, so the steady state has
+        # to cost one line read - not a walk of 8 000+ entries.
+        stub.sync_stub(self._registry(_SHA_A), path=self.path)
+        with patch.object(stub, 'write_stub',
+                          side_effect=AssertionError('must not walk the registry')):
+            self.assertFalse(stub.sync_stub(self._registry(_SHA_A),
+                                            path=self.path))
+
+    def test_an_unwritable_target_is_skipped_before_the_walk(self):
+        with patch.object(stub, '_is_writable', return_value=False):
+            with patch.object(stub, 'write_stub',
+                              side_effect=AssertionError('must not walk the registry')):
+                with self.assertLogs('volkano.stub', level='INFO') as logs:
+                    self.assertFalse(stub.sync_stub(self._registry(_SHA_A),
+                                                    path=self.path))
+        self.assertIn('python -m volkano update', logs.output[0])
+        self.assertFalse(os.path.exists(self.path))
+
     def test_write_failure_does_not_raise(self):
         with patch.object(stub, 'write_stub',
                           side_effect=OSError('read-only file system')):
@@ -202,41 +221,6 @@ class SyncStubTests(_StubPathCase):
             with self.assertLogs('volkano.stub', level='WARNING'):
                 self.assertFalse(
                     stub.sync_stub(self._registry(_SHA_A), path=self.path))
-
-
-class StubIsStaleTests(_StubPathCase):
-    """The cheap check the facade runs on every build."""
-
-    def _registry(self, sha, uri=_URI_A):
-        return _FakeRegistry({'VK_FOO': 1},
-                             provenance=Provenance(sha, uri, 359))
-
-    def test_a_missing_stub_is_stale(self):
-        self.assertTrue(stub.stub_is_stale(self._registry(_SHA_A),
-                                           path=self.path))
-
-    def test_a_freshly_written_stub_is_not_stale(self):
-        stub.sync_stub(self._registry(_SHA_A), path=self.path)
-        self.assertFalse(stub.stub_is_stale(self._registry(_SHA_A),
-                                            path=self.path))
-
-    def test_changed_bytes_or_uri_go_stale(self):
-        stub.sync_stub(self._registry(_SHA_A), path=self.path)
-        self.assertTrue(stub.stub_is_stale(self._registry(_SHA_B),
-                                           path=self.path))
-        self.assertTrue(stub.stub_is_stale(self._registry(_SHA_A, _URI_B),
-                                           path=self.path))
-
-    def test_no_provenance_is_never_stale(self):
-        # An Element fixture has no identity to be out of date with.
-        self.assertFalse(stub.stub_is_stale(_FakeRegistry({'VK_FOO': 1}),
-                                            path=self.path))
-
-    def test_checking_never_writes(self):
-        with patch.object(stub, 'write_stub',
-                          side_effect=AssertionError('must not write')):
-            stub.stub_is_stale(self._registry(_SHA_A), path=self.path)
-        self.assertFalse(os.path.exists(self.path))
 
 
 class BuildRegistryLeavesStubAloneTests(_StubPathCase):

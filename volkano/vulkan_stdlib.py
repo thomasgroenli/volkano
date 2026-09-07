@@ -25,11 +25,12 @@ import sys
 from .cbase import (
     Handle, Enum, FunctionPointer, Pointer, Array, Struct, Union, friendly,
     decoder,
-    char,
+    char, byte, ubyte,
     int8, uint8, int16, uint16, int32, uint32, int64, uint64,
-    float32, float64, size,
+    float32, float64, size, ssize,
 )
 from .lazy import Lazy
+from .xml_parser import VOID, VOID_P
 
 
 # Module logger. Lifecycle events (registry built, library attached,
@@ -47,19 +48,16 @@ logger = logging.getLogger('volkano.stdlib')
 # Primitives
 # ---------------------------------------------------------------------------
 
-#: Primitive type table — these become top-level registry entries with
-#: literal type values, so a Force-lookup of ``"uint32_t"`` resolves
-#: straight to :class:`cbase.uint32` without going through any factory.
+#: C spelling → cbase type, for ``<type category="basetype">`` typedefs
+#: (``typedef uint32_t VkSampleMask``), where the underlying name reaches
+#: :func:`make_basetype` as a string rather than as a registry lookup.
 #:
-#: Every slot maps to a cbase type so that whatever flows into a struct
-#: field or command signature carries the cbase surface (arithmetic,
-#: comparison, ``.ref``, ``.ptr``, …) and decays correctly into the
-#: cbase Pointer slots ``ref()`` produces. The C primitives without a
-#: fixed-width cbase scalar use the closest one (``int`` → 32-bit
-#: :class:`cbase.int32`, ``bool`` → 1-byte :class:`cbase.uint8`),
-#: ``void *`` is ``Pointer[None]`` and ``char *`` is ``Pointer[char]``
-#: (its data supplied as ``bytes``). No raw ctypes type reaches the
-#: registry.
+#: A lookup table, *not* a namespace: these keys are no longer merged
+#: into the registry, because a member declared ``uint32_t`` is
+#: translated to ``uint32`` by :data:`~volkano.xml_parser.CANONICAL_TYPE_NAMES`
+#: before it is ever looked up. Publishing both spellings put two keys on
+#: one class and stood ``vk.int`` / ``vk.bool`` / ``vk.float`` in front of
+#: the builtins they shadow, for names no one types.
 PRIMITIVES: dict = {
     'void':     None,
     'char':     char,
@@ -81,6 +79,35 @@ PRIMITIVES: dict = {
     'uintptr_t': uint64,
     'ptrdiff_t': int64,
     'void_p':   Pointer[None],
+}
+
+
+#: The same scalars under cbase's own names, so ``vk.float32`` resolves
+#: beside ``vk.float``. :data:`PRIMITIVES` is keyed on C spellings
+#: because that is what vk.xml writes; these are the names *volkano*
+#: writes — what the generated stub annotates every struct field and
+#: parameter with, and what :mod:`volkano.cbase` calls them. Someone who
+#: has read either and reaches for ``vk.float32`` should not have to
+#: discover that the registry files it under ``float``.
+#:
+#: Merged after PRIMITIVES and before the XML, so a name vk.xml defines
+#: still wins — nothing here can shadow a Vulkan type.
+SCALARS: dict = {
+    'char':    char,
+    'byte':    byte,
+    'ubyte':   ubyte,
+    'int8':    int8,
+    'uint8':   uint8,
+    'int16':   int16,
+    'uint16':  uint16,
+    'int32':   int32,
+    'uint32':  uint32,
+    'int64':   int64,
+    'uint64':  uint64,
+    'float32': float32,
+    'float64': float64,
+    'size':    size,
+    'ssize':   ssize,
 }
 
 
@@ -526,13 +553,39 @@ class VkRegistry(Lazy):
         return bound
 
     def __getattr__(self, name):
+        """Attribute access over the registry, forcing on first touch.
+
+        Every failure leaves here as :class:`AttributeError`, including
+        an entry that exists but cannot be *built*. vk.xml declares the
+        window-system and video types — ``HINSTANCE``, ``wl_display``,
+        ``StdVideoH264SequenceParameterSet`` — without defining them,
+        leaving each to a platform header volkano does not read, so the
+        structs referencing them raise ``KeyError`` from the kernel.
+        Letting that out of attribute access breaks the protocol every
+        introspecting tool depends on: ``hasattr`` raises instead of
+        answering, ``getattr(vk, name, default)`` raises instead of
+        returning the default, and anything walking :func:`dir` dies on
+        the first one.
+
+        Forcing through ``registry(name)`` is unchanged and still raises
+        the ``KeyError`` naming the missing type, for callers who would
+        rather have the failure than the absence.
+        """
         # Only invoked on normal-lookup miss, so kernel attributes
         # (``_data``, ``_cache``, ``_library``) are never intercepted.
         if name.startswith('_'):
             raise AttributeError(name)
         if name not in self._data:
             raise AttributeError(name)
-        return self(name)
+        try:
+            return self(name)
+        except KeyError as exc:
+            missing = exc.args[0] if exc.args else '(unknown)'
+            raise AttributeError(
+                f'{name!r} exists in this registry but cannot be built: it '
+                f'references {missing!r}, which is not defined here. vk.xml '
+                f'leaves platform and video types to their own headers, so '
+                f'the entries that use them are unreachable.') from exc
 
     def __dir__(self):
         base = set(super().__dir__())
@@ -587,7 +640,15 @@ def build_registry(source=None, *, library=None, api='vulkan'):
 # ---------------------------------------------------------------------------
 
 STDLIB: dict = {}
-STDLIB.update(PRIMITIVES)
+STDLIB.update(SCALARS)
+STDLIB.update({
+    # The two slots with no name a user would type. Underscore-prefixed
+    # (see xml_parser.VOID / VOID_P) so the thunk graph resolves them
+    # while attribute access, dir() and the stub pass them by: C ``void``
+    # is the absence of a type, and ``void *`` is type-erased.
+    VOID:               None,
+    VOID_P:             Pointer[None],
+})
 STDLIB.update({
     'ref':              ref,
     'array':            array,

@@ -48,18 +48,41 @@ The stub
 
 A companion ``__init__.pyi`` declares every name with light type
 annotations, so IDEs surface autocomplete and parameter hints even
-though all names resolve dynamically. **Importing volkano never writes
-it** — generating it forces every entry in the registry and writes into
-the installed package, which is far too much to do behind an ``import``
-statement. ``python -m volkano update`` writes it; import only notices
-when it has gone stale, and says so at INFO.
+though all names resolve dynamically. It is written on first use, by
+the same call that builds the registry: find the XML in the cache or
+fetch it, build, and bring the stub level with what was built.
+
+That is one rule rather than two, and it holds whatever state a fresh
+install starts from — no cached XML, no stub, or a stub left over from
+a source the user has since changed. What it costs is paid once: the
+stamp on line 1 of the stub records the XML it came from, so every
+later import compares one line and writes nothing.
+
+The case this does not serve well is two projects sharing one
+virtualenv and naming different sources: each one's first import
+rewrites the other's stub, a full regeneration every time they
+alternate. Accepted for v1 — it costs autocomplete and a second of
+import, never correctness, and avoiding it means keeping the second
+rule this replaces.
+
+``python -m volkano update`` is the other half — the only thing that
+refetches a URI already in the cache, since nothing revalidates on its
+own.
 """
 
 from __future__ import annotations
 
 import logging as _logging
 import os as _os
+import threading as _threading
 from typing import Any
+
+
+#: The one place this project's version is written. ``pyproject.toml``
+#: reads it from here (``dynamic = ["version"]``), so the distribution
+#: metadata, ``volkano.__version__`` and the User-Agent the fetcher
+#: sends cannot drift apart the way a second copy would.
+__version__ = '0.0.1'
 
 
 _logger = _logging.getLogger('volkano')
@@ -67,6 +90,15 @@ _logger = _logging.getLogger('volkano')
 # Lazy singleton for the module facade. ``None`` means "not built yet";
 # the first non-underscore attribute access builds it.
 _registry: Any = None
+
+# Guards the build, so racing threads share one registry rather than
+# each parsing the XML and handing out its own ctypes classes — two
+# VkInstance classes for one Vulkan type is an
+# ``expected VkInstance instance, got VkInstance`` waiting to happen.
+# Re-entrant because anything the build touches may itself reach for a
+# ``volkano.<name>``. The kernel has its own lock for forcing; this one
+# covers the step above it, which had none.
+_lock = _threading.RLock()
 
 # Distinguishes "use() was never called for this" from "use() was called
 # with None" — the latter is a real choice meaning "take the default",
@@ -127,15 +159,20 @@ def use(source: Any = _UNSET, *, library: Any = _UNSET) -> None:
     once ctypes classes from the old registry are loose in the program.
     """
     global _source_override, _library_override
-    if _registry is not None:
-        raise RuntimeError(
-            'volkano.use() was called after the registry had already been '
-            'built by an earlier attribute access; move it above the first '
-            'use of volkano, or build a separate one with volkano.registry().')
-    if source is not _UNSET:
-        _source_override = source
-    if library is not _UNSET:
-        _library_override = library
+    # Same lock as the build, so a call that races one either lands
+    # wholly before it or raises — never half-applies to a registry
+    # that is already being constructed from the old settings.
+    with _lock:
+        if _registry is not None:
+            raise RuntimeError(
+                'volkano.use() was called after the registry had already '
+                'been built by an earlier attribute access; move it above '
+                'the first use of volkano, or build a separate one with '
+                'volkano.registry().')
+        if source is not _UNSET:
+            _source_override = source
+        if library is not _UNSET:
+            _library_override = library
 
 
 def get_registry():
@@ -147,7 +184,13 @@ def get_registry():
     stub check.
     """
     global _registry
-    if _registry is None:
+    # Fast path, deliberately lock-free: once published, the singleton
+    # is never reassigned, and reading a module global is atomic.
+    if _registry is not None:
+        return _registry
+    with _lock:
+        if _registry is not None:
+            return _registry
         # An unset variable and a blank one mean the same thing: take
         # the default. Blank is easy to produce by accident (`export
         # VOLKANO_XML=`, a declared-but-empty CI variable) and must not
@@ -166,37 +209,36 @@ def get_registry():
             spec = _os.environ.get('VOLKANO_LIBRARY', '').strip() or True
             library = None if spec == 'none' else spec
         built = registry(source=source, library=library)
-        # Publish before the stub check, so that a re-entrant
-        # volkano.<attr> from anything it touches finds the singleton
-        # rather than starting a second build.
+        # Publish inside the lock; sync outside it. Publishing first is
+        # what lets a re-entrant ``volkano.<attr>`` — from the sync or
+        # from anything it touches — find the singleton instead of
+        # starting a second build. Releasing first is what keeps every
+        # other thread from waiting on a stub regeneration that has
+        # nothing to do with the name it asked for.
         _registry = built
-        _note_if_stub_is_stale(built)
-    return _registry
+    _sync_stub(built)
+    return built
 
 
-def _note_if_stub_is_stale(built: Any) -> None:
-    """Log a pointer at ``python -m volkano update``; never write.
+def _sync_stub(built: Any) -> None:
+    """Bring ``__init__.pyi`` level with what was just built.
 
-    Deliberately only a log line. Regenerating here would force all
-    8 000-odd entries and write a megabyte into site-packages as a side
-    effect of ``import`` — slow on a cold install, silently impossible
-    on a read-only prefix, and a tug-of-war between two projects that
-    share one virtualenv and name different sources.
+    A no-op in the steady state — :func:`~volkano.stub.sync_stub` reads
+    the stamp on line 1 and returns without forcing anything when it
+    already agrees. It writes on the three occasions where it doesn't:
+    a fresh install with no stub, a source the user has changed, and a
+    stub this generator has outgrown.
 
-    Swallows everything: a missing or unreadable stub is the normal
-    state of a fresh install, and nothing about this check is worth
-    failing an import over.
+    Swallows everything, and :func:`~volkano.stub.sync_stub` swallows
+    its own write failures on top of that. A stub costs autocomplete
+    and never correctness, so there is no state of it — missing,
+    unreadable, unwritable — worth failing an ``import`` over.
     """
     try:
-        from .stub import stub_is_stale
-        if stub_is_stale(built):
-            _logger.info(
-                'volkano/__init__.pyi is out of date with %s; run '
-                '`python -m volkano update` to refresh editor completions',
-                getattr(getattr(built, '_provenance', None), 'uri',
-                        'the current source'))
+        from .stub import sync_stub
+        sync_stub(built)
     except Exception:               # pragma: no cover - never load-bearing
-        _logger.debug('stub staleness check failed', exc_info=True)
+        _logger.debug('stub sync failed', exc_info=True)
 
 
 def __getattr__(name: str) -> Any:
@@ -218,7 +260,7 @@ def __getattr__(name: str) -> Any:
 
 def __dir__() -> list[str]:
     """Surface every registered name to ``dir(volkano)`` and tab completion."""
-    base = {'registry', 'get_registry', 'use'}
+    base = {'registry', 'get_registry', 'use', '__version__'}
     base.update(name for name in dir(get_registry())
                 if not name.startswith('_'))
     return sorted(base)

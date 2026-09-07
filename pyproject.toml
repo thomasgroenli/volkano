@@ -1,31 +1,56 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "volkano"
-version = "0.0.1"
-description = "Pure-Python Vulkan driver interface — ctypes-based, lazy registry-driven, zero compiled code in the wheel"
+dynamic = ["version"]
+description = "Pure-Python Vulkan driver interface for compute — ctypes-based, lazy registry-driven, zero compiled code in the wheel"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Thomas Grønli", email = "thomas.gronli@gmail.com" }]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Graphics :: 3D Rendering",
     "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
 ]
+
+[project.urls]
+Homepage = "https://github.com/thomasgroenli/volkano"
+Repository = "https://github.com/thomasgroenli/volkano"
+
+# Single source of truth: volkano/__init__.py. setuptools reads the
+# literal out of the module's AST, so nothing is imported at build time.
+[tool.setuptools.dynamic]
+version = { attr = "volkano.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["volkano*"]
 exclude = ["tests*"]
 
 # PEP 561 marker. Without it a type checker ignores __init__.pyi even
-# once it exists. The stub itself is generated on the user's machine by
-# `python -m volkano update` rather than shipped, because it describes
-# whichever vk.xml that machine is actually built against — so it is
-# deliberately absent from the wheel. Importing volkano does not write
-# it; a stale or missing stub costs autocomplete and nothing else.
+# once it exists.
 [tool.setuptools.package-data]
 volkano = ["py.typed"]
+
+# __init__.pyi is a *build artifact of the user's machine*, written on
+# first use from whichever vk.xml that machine resolves. It must never
+# enter a distribution: setuptools picks up .pyi files next to a package
+# automatically, so without this exclusion the wheel's contents depend on
+# whether the maintainer happened to have imported volkano before
+# building — one machine ships a 1.9 MB stub stamped with its own XML,
+# another ships none, from the same commit.
+[tool.setuptools.exclude-package-data]
+volkano = ["__init__.pyi"]
 

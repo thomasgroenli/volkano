@@ -83,12 +83,19 @@ class ResolveSourceTests(unittest.TestCase):
         # The URI lands in the stub's provenance stamp. A relative one
         # would mean something different after a cd, regenerating the
         # stub for no reason at all.
-        here = pathlib.Path.cwd()
+        # Both sides go through resolve(): on Windows it canonicalises
+        # via the filesystem, and under contention (an indexer holding
+        # the directory after a large write) it can fall back to a
+        # differently-cased path. Comparing a resolved URI against an
+        # unresolved Path.cwd() made this flake; resolving both keeps
+        # the assertion and drops the race.
+        here = pathlib.Path.cwd().resolve()
         self.assertEqual(xp.resolve_source('vk.xml').uri,
                          (here / 'vk.xml').as_uri())
 
     def test_a_file_uri_round_trips_to_the_same_path(self):
-        target = pathlib.Path.cwd() / 'xml' / 'vk.xml'
+        # Resolved on both sides, for the reason above.
+        target = pathlib.Path.cwd().resolve() / 'xml' / 'vk.xml'
         self.assertEqual(xp.resolve_source(target.as_uri()).path, target)
 
     def test_a_windows_drive_letter_is_not_a_scheme(self):
@@ -145,8 +152,10 @@ class CacheNameTests(unittest.TestCase):
         self.assertNotIn('https', self._name('https://e.invalid/x/vk.xml'))
 
     def test_local_files_get_no_cache_entry(self):
+        # Resolved on both sides, as above.
         src = xp.resolve_source('./xml/vk.xml')
-        self.assertEqual(src.path, pathlib.Path.cwd() / 'xml' / 'vk.xml')
+        self.assertEqual(src.path,
+                         pathlib.Path.cwd().resolve() / 'xml' / 'vk.xml')
 
 
 class CacheTests(_CacheDirCase):

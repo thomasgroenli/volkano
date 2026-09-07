@@ -6,8 +6,9 @@ import unittest
 
 from volkano import cbase
 from volkano.lazy import _Thunk, _Raw, SELF, Force
+from volkano.xml_parser import CANONICAL_TYPE_NAMES, VOID, VOID_P
 from volkano.vulkan_stdlib import (
-    STDLIB, VkRegistry, CommandSignature,
+    STDLIB, SCALARS, VkRegistry, CommandSignature,
     ref, array,
     make_handle, make_basetype, make_bitmask, make_enum,
     make_funcpointer, make_struct, make_union, make_command,
@@ -143,8 +144,8 @@ class StructUnionTests(unittest.TestCase):
     def test_struct_basic_fields(self):
         r = _registry({
             'S': _Thunk(make_struct, SELF, 'S', _Raw([
-                ['a', Force('uint32_t')],
-                ['b', Force('int32_t')],
+                ['a', Force('uint32')],
+                ['b', Force('int32')],
             ])),
         })
         S = r('S')
@@ -158,7 +159,7 @@ class StructUnionTests(unittest.TestCase):
         r = _registry({
             'Node': _Thunk(make_struct, SELF, 'Node', _Raw([
                 ['next', _Thunk(ref, Force('Node'))],
-                ['value', Force('uint32_t')],
+                ['value', Force('uint32')],
             ])),
         })
         Node = r('Node')
@@ -170,8 +171,8 @@ class StructUnionTests(unittest.TestCase):
     def test_union_basic(self):
         r = _registry({
             'U': _Thunk(make_union, SELF, 'U', _Raw([
-                ['a', Force('uint32_t')],
-                ['b', Force('float')],
+                ['a', Force('uint32')],
+                ['b', Force('float32')],
             ])),
         })
         U = r('U')
@@ -268,6 +269,91 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(r.rebind_commands(), 0)  # already bound
 
 
+class ScalarNameTests(unittest.TestCase):
+    """One name per type: cbase's, with the C spellings translated away."""
+
+    def test_every_scalar_name_is_registered(self):
+        r = _registry()
+        for name, cls in SCALARS.items():
+            with self.subTest(name=name):
+                self.assertIs(r(name), cls)
+
+    def test_the_c_spellings_are_not_registry_keys(self):
+        # They are translated in the parser (CANONICAL_TYPE_NAMES), so
+        # publishing them too would put two keys on one class - and
+        # stand vk.int / vk.bool / vk.float in front of the builtins.
+        r = _registry()
+        for name in ('uint32_t', 'int32_t', 'float', 'int', 'bool', 'size_t'):
+            with self.subTest(name=name):
+                self.assertNotIn(name, r)
+
+    def test_the_canonical_target_of_every_c_spelling_is_registered(self):
+        # The map may not name a key that does not exist: a member
+        # declared in a spelling that translates nowhere would fail to
+        # resolve, and only against real XML.
+        r = _registry()
+        for spelling, target in CANONICAL_TYPE_NAMES.items():
+            with self.subTest(spelling=spelling):
+                self.assertIn(target, r)
+
+    def test_the_void_slots_resolve_but_stay_out_of_the_way(self):
+        r = _registry()
+        self.assertIsNone(r(VOID))
+        self.assertIs(r(VOID_P), cbase.Pointer[None])
+        self.assertNotIn(VOID, dir(r))
+        self.assertNotIn(VOID_P, dir(r))
+
+    def test_the_xml_still_wins_over_a_stdlib_name(self):
+        # Merge order is SCALARS, the void slots, the factories, then
+        # the parsed XML.
+        r = VkRegistry({**STDLIB, 'float32': _Raw('from-the-xml')})
+        self.assertEqual(r('float32'), 'from-the-xml')
+
+
+class UnbuildableEntryTests(unittest.TestCase):
+    """An entry that exists but names a type the registry doesn't define.
+
+    vk.xml declares HINSTANCE / wl_display / StdVideo* without defining
+    them; the structs using them can only fail. Attribute access has to
+    answer that as absence, or hasattr() and getattr()'s default stop
+    working for every one of them.
+    """
+
+    def _registry(self):
+        return VkRegistry({**STDLIB, 'VkNeedsPlatform': _Thunk(
+            make_struct, SELF, 'VkNeedsPlatform',
+            _Raw([['handle', Force('HINSTANCE')]]))})
+
+    def test_attribute_access_raises_attribute_error(self):
+        with self.assertRaises(AttributeError):
+            self._registry().VkNeedsPlatform
+
+    def test_the_message_names_the_type_that_is_missing(self):
+        with self.assertRaisesRegex(AttributeError, "'HINSTANCE'"):
+            self._registry().VkNeedsPlatform
+
+    def test_hasattr_answers_instead_of_raising(self):
+        self.assertFalse(hasattr(self._registry(), 'VkNeedsPlatform'))
+
+    def test_getattr_returns_the_default(self):
+        self.assertEqual(
+            getattr(self._registry(), 'VkNeedsPlatform', 'fallback'),
+            'fallback')
+
+    def test_the_key_error_survives_as_the_cause(self):
+        try:
+            self._registry().VkNeedsPlatform
+        except AttributeError as exc:
+            self.assertIsInstance(exc.__cause__, KeyError)
+        else:
+            self.fail('expected AttributeError')
+
+    def test_forcing_still_raises_the_key_error(self):
+        # The failure stays available to callers who want it.
+        with self.assertRaises(KeyError):
+            self._registry()('VkNeedsPlatform')
+
+
 class RegistryAttrTests(unittest.TestCase):
 
     def test_registry_getattr_forces_key(self):
@@ -292,7 +378,7 @@ class RegistryAttrTests(unittest.TestCase):
         })
         names = dir(r)
         self.assertIn('VkBool32', names)
-        self.assertIn('uint32_t', names)
+        self.assertIn('uint32', names)
 
 
 if __name__ == '__main__':

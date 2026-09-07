@@ -1,6 +1,7 @@
 # volkano
 
-Pure-Python Vulkan driver interface — ctypes only, lazy registry-driven, zero compiled code in the wheel.
+Pure-Python Vulkan driver interface for **compute** — ctypes only, lazy
+registry-driven, zero compiled code in the wheel.
 
 ```sh
 pip install volkano
@@ -8,9 +9,67 @@ pip install volkano
 
 ```python
 import volkano as vk
-inst_info = vk.VkInstanceCreateInfo(sType=vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO)
-# ...
+
+app = vk.VkApplicationInfo(sType=vk.VK_STRUCTURE_TYPE_APPLICATION_INFO,
+                           pApplicationName=b'demo',
+                           apiVersion=vk.VK_API_VERSION_1_0)
+info = vk.VkInstanceCreateInfo(sType=vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+                               pApplicationInfo=app.ptr)
+
+instance = vk.VkInstance()
+result = vk.vkCreateInstance(info.ref, None, instance.ref)
+assert result is vk.VK_SUCCESS
+
+count = vk.uint32()
+vk.vkEnumeratePhysicalDevices(instance, count.ref, None)
+print(f'{count.value} physical device(s)')
+
+vk.vkDestroyInstance(instance, None)
 ```
+
+Four things in there are the whole calling convention:
+
+- **`.ptr` for a struct field, `.ref` for an argument.** `x.ptr` is a real
+  typed pointer, which is what a `pApplicationInfo` slot holds; `x.ref` is
+  `byref(x)`, which is what a command parameter wants. Using `.ref` in a
+  field raises `TypeError: expected Pointer[VkApplicationInfo] instance` —
+  the one mistake everybody makes first.
+- **Commands return the enum member**, so `result is vk.VK_SUCCESS` holds
+  and a failure prints as `VkResult.VK_ERROR_INITIALIZATION_FAILED` rather
+  than as `-3`.
+- **Enumerants are their group's member**: `vk.VK_SUCCESS` *is*
+  `vk.VkResult.VK_SUCCESS`, not a separate `int` that compares equal.
+- **Scalars are named as cbase names them** — `vk.uint32`, `vk.float32` —
+  and carry `.ref`, `.ptr`, `.value` and `.size`. vk.xml's C spellings
+  (`uint32_t`) are translated to these, so there is exactly one name per
+  type.
+
+## Scope of the first release
+
+Compute is the target, and it works end to end: instances, physical
+device enumeration and properties, logical devices and queues, buffers
+and memory requirements, descriptor sets, pipelines, command pools and
+submission all resolve and dispatch.
+
+Two areas do not, and both for the same reason — `vk.xml` *declares*
+their types without defining them, leaving `HINSTANCE`, `Display`,
+`wl_display`, `HANDLE` and the `StdVideo*` family to platform and video
+headers volkano does not read:
+
+- **Window-system integration.** `VkWin32SurfaceCreateInfoKHR`,
+  `VkXlibSurfaceCreateInfoKHR`, `VkWaylandSurfaceCreateInfoKHR` and
+  `vkCreateWin32SurfaceKHR` are unreachable, so there is no way to make a
+  surface to present to. The swapchain types themselves are fine — it is
+  only the surface underneath them that is missing.
+- **Win32 external memory, semaphore and fence interop**, which needs
+  `HANDLE`.
+- **Video encode and decode**, which needs the separate `vulkan_video`
+  registry.
+
+That is 109 of 9 074 entries. Touching one raises `AttributeError` naming
+the type that is missing rather than failing obscurely, and `hasattr`
+reports them absent — so a capability probe works, and nothing else in
+the registry is affected.
 
 ## Two ways to use it
 
@@ -28,8 +87,12 @@ source tree — so several can coexist:
 
 ```python
 import volkano
-vk = volkano.registry(library=True)                  # Khronos main
-vk = volkano.registry(V1_4_359_URL, library=True)    # or any vk.xml
+
+TAG = ('https://raw.githubusercontent.com/KhronosGroup/Vulkan-Docs'
+       '/refs/tags/v1.4.359/xml/vk.xml')
+
+vk = volkano.registry(library=True)         # Khronos main branch
+vk = volkano.registry(TAG, library=True)    # or any vk.xml, by URL
 ```
 
 The first is the second applied to two environment variables. There is
@@ -74,9 +137,10 @@ something else imported first.
 Both variables are read on first use, not at import, and only by the
 module facade — `registry()` takes arguments and nothing else.
 
-Remote XML is cached under `%LOCALAPPDATA%\volkano\xml` (or
-`~/.cache/volkano/xml`) and **never revalidated**, so imports do no
-network I/O whatever the source. A URI carries no evidence of whether
+Remote XML is fetched into `%LOCALAPPDATA%\volkano\xml` (or
+`~/.cache/volkano/xml`) the first time it is needed and **never
+revalidated** after that, so no import past the first does network
+I/O. A URI carries no evidence of whether
 what it names can move — a tag URL and a branch URL are the same shape
 — so rather than guess, volkano refetches only when told to:
 
@@ -85,7 +149,9 @@ python -m volkano update
 ```
 
 That refetches the configured source and rewrites the `.pyi` stub from
-it.
+it. Everything else is first-use: the XML is taken from the cache if it
+is there and fetched into it if it isn't, and the stub is brought level
+with whatever was built.
 
 ## Notes
 
@@ -93,12 +159,16 @@ it.
   build and not at lookup. The entire registry, commands included, resolves
   and introspects on a machine with no Vulkan driver installed; only
   dispatch needs one.
-- **`__init__.pyi` is generated** by `python -m volkano update`, and stamped
-  with the hash and URI of the XML it came from. Importing volkano never
-  writes it — that would force all 8 000-odd entries and write a megabyte
-  into the installed package behind an `import` statement. Import only
-  compares the stamp and logs at INFO when it has gone stale. A missing or
-  stale stub costs autocomplete and nothing else.
+- **`__init__.pyi` is written on first use**, and stamped with the hash and
+  URI of the XML it came from. Later imports compare that one line and stop
+  there — the walk that regenerating costs (~1 s, all 8 000-odd entries) is
+  paid only when the stamp disagrees: a fresh install, a changed source, or
+  an improved generator. An unwritable target is skipped rather than
+  retried, and every failure is swallowed; a missing or stale stub costs
+  autocomplete and nothing else.
+- **`volkano.registry()` never writes it.** Only the module facade syncs the
+  stub, so a registry you construct yourself — one per source, several at
+  once — leaves your source tree alone.
 - **Forcing is thread-safe** — racing threads share one value per key, so
   ctypes class identity stays consistent.
 
@@ -112,4 +182,4 @@ it.
 - `volkano.vulkan_stdlib` — the factories the thunk graph calls, plus `VkRegistry`.
 - `volkano.stub` — `.pyi` generation and the `python -m volkano update` maintenance CLI.
 
-Designed as a stable substrate for higher-level libraries. See [kaldera](../kaldera) for the ergonomic compute layer on top.
+Designed as a stable substrate for higher-level libraries.

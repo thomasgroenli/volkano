@@ -25,9 +25,10 @@ from ``src/spec/`` to ``xml/`` and across all three of the tag-naming
 families Khronos has used.
 
 Nothing is ever revalidated. A URI is fetched when it is missing from
-the cache and at no other time, so a normal import does no network I/O
-whatever the source is. ``python -m volkano update`` is the one thing
-that refetches.
+the cache and at no other time — so the first use of a source pays one
+download and no import after that touches the network.
+``python -m volkano update`` is the one thing that refetches an entry
+already in the cache.
 """
 
 from __future__ import annotations
@@ -42,6 +43,8 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any, NamedTuple
+
+from . import __version__
 
 
 # Acquisition logger. Network fetches surface at INFO (so a single
@@ -80,7 +83,10 @@ _FETCHABLE_SCHEMES = ('http', 'https')
 _SCHEME_RE = re.compile(r'^([A-Za-z][A-Za-z0-9+.\-]+)://')
 
 _UNSAFE_IN_FILENAME_RE = re.compile(r'[^A-Za-z0-9._+-]')
-_USER_AGENT = 'volkano/0.1 (+https://github.com/KhronosGroup/Vulkan-Docs)'
+#: Identifies *this* client to the server, so it names volkano's own
+#: repository — the previous URL pointed at Khronos's, which is the
+#: thing being fetched, not the thing doing the fetching.
+_USER_AGENT = f'volkano/{__version__} (+https://github.com/thomasgroenli/volkano)'
 
 #: How much of a URI to keep in its cache filename. Long enough that
 #: the tail of a raw.githubusercontent URL still names the ref, short

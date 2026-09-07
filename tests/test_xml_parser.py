@@ -16,6 +16,7 @@ from volkano import xml_parser as xp
 from volkano import xml_source
 from volkano.lazy import _Thunk
 from volkano.vulkan_stdlib import STDLIB, VkRegistry
+from volkano import cbase
 
 
 class _CacheDirCase(unittest.TestCase):
@@ -139,6 +140,47 @@ class LegacyEnumDialectTests(unittest.TestCase):
         target = aliases[0][1]
         self.assertIsInstance(target, _Thunk)          # i.e. Force(...)
         self.assertEqual(target.args, ('SOMETHING_ELSEWHERE',))
+
+
+class CanonicalTypeNameTests(unittest.TestCase):
+    """A type is named once, in cbase's spelling, wherever it appears."""
+
+    def _form(self, xml):
+        return xp.type_form(ET.fromstring(xml))
+
+    def test_a_c_spelling_resolves_the_cbase_key(self):
+        form = self._form('<member><type>uint32_t</type><name>x</name></member>')
+        self.assertEqual(form.args, ('uint32',))
+
+    def test_a_vulkan_type_passes_through_untouched(self):
+        form = self._form('<member><type>VkInstance</type><name>x</name></member>')
+        self.assertEqual(form.args, ('VkInstance',))
+
+    def test_void_pointer_takes_the_type_erased_slot(self):
+        form = self._form('<member><type>void</type>* <name>p</name></member>')
+        self.assertEqual(form.args, (xp.VOID_P,))
+
+    def test_a_missing_type_element_takes_the_same_slot(self):
+        self.assertEqual(self._form('<member><name>p</name></member>').args,
+                         (xp.VOID_P,))
+
+    def test_bare_void_takes_the_absence_of_a_type_slot(self):
+        self.assertEqual(self._form('<proto><type>void</type><name>f</name></proto>').args,
+                         (xp.VOID,))
+
+    def test_a_pointer_to_a_c_spelling_wraps_the_canonical_key(self):
+        form = self._form('<member><type>float</type>* <name>p</name></member>')
+        # Call('ref', [Force('float32')])
+        self.assertEqual(form.args[0].args, ('float32',))
+
+    def test_translation_reaches_the_registry(self):
+        reader = xp.XmlReader(ET.fromstring(
+            '<registry><types>'
+            '<type category="struct" name="S">'
+            '<member><type>uint32_t</type><name>a</name></member>'
+            '</type></types></registry>'))
+        r = VkRegistry({**STDLIB, **reader.run()})
+        self.assertIs(dict(r('S')._fields_)['a'], cbase.uint32)
 
 
 class EnumerantEntryTests(unittest.TestCase):

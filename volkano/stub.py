@@ -24,26 +24,24 @@ that against the registry it is handed and rewrites only on a
 mismatch. Stamping content rather than keying off "did we just
 download something" is what makes it self-healing: a deleted stub, a
 pre-populated cache and an interrupted write all repair themselves on
-the next ``update``.
+the next build, with no bookkeeping to get out of step.
 
-**Importing volkano never writes this file.** Generating it forces
-every one of the 8 000+ registry entries and writes about a megabyte
-into the installed package, which is not something an import should
-do: it is slow on a cold install, it fails silently on a read-only
-prefix, and two projects sharing a virtualenv with different sources
-would take turns overwriting each other's copy.
-:func:`volkano.get_registry` instead calls :func:`stub_is_stale` —
-which reads one line and forces nothing — and logs a note pointing at
-``python -m volkano update``.
+That comparison is cheap enough — one line read, nothing forced — that
+:func:`volkano.get_registry` runs it on every build, which is why a
+fresh install gets a stub without being asked to. The expensive half
+runs only on a mismatch, and :func:`sync_stub` keeps it that way: it
+declines up front when the target isn't writable (an installed package
+on a read-only prefix would otherwise force all 8 000+ entries every
+import only to fail the write), and swallows whatever the write raises.
 
 The stub is purely a hint for tooling; the package itself works
-without it, which is what makes deferring it to an explicit command
-affordable.
+without it, which is what keeps every one of those failures harmless.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import ctypes
 import enum
 import itertools
@@ -71,7 +69,7 @@ _HEADER = '''\
 # __getattr__ on the package; this file exists purely so static
 # analysers can offer autocomplete and parameter hints.
 
-from typing import Any
+from typing import Any, TypeAlias
 import enum
 
 # Every type the registry emits is a cbase type (no raw ctypes): char*
@@ -84,11 +82,47 @@ from volkano.cbase import (
 )
 
 
-# Real functions in volkano/__init__.py.
+# Real names in volkano/__init__.py.
+__version__: str
 def registry(source: Any = ..., *, library: Any = ...) -> Any: ...
 def get_registry() -> Any: ...
 
 '''
+
+
+def _header_bound_names() -> frozenset[str]:
+    """Names :data:`_HEADER` already binds, plus the builtins we annotate with.
+
+    A registry entry whose key is one of these must not be declared
+    again. The header imports ``float32`` from cbase *as a type* and the
+    emitters write ``x: float32`` thousands of times over; a later
+    ``float32: Any`` rebinds the name to a variable, and every one of
+    those annotations becomes "Variable not allowed in type expression".
+    The same trap catches the C spellings that shadow builtins — vk.xml
+    registers ``int``, ``float`` and ``bool``, against the ``: int`` /
+    ``: float`` / ``: bool`` the constant emitter writes.
+
+    Skipping them loses nothing: the import *is* the declaration, and it
+    is a better one — ``char`` reaches a checker as the cbase class the
+    registry actually returns rather than as ``Any``.
+
+    Read out of the header text rather than listed by hand. The header
+    and the emitters are edited independently, and a hand-kept copy of
+    one inside the other is exactly the kind of thing that drifts
+    silently until a stub stops type-checking.
+    """
+    names = {'int', 'float', 'str', 'bool', 'bytes'}
+    for node in ast.walk(ast.parse(_HEADER)):
+        if isinstance(node, ast.alias):
+            names.add((node.asname or node.name).split('.')[0])
+        elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return frozenset(names)
+
+
+_HEADER_NAMES = _header_bound_names()
 
 
 def _classify(value: Any) -> str:
@@ -315,8 +349,31 @@ def _emit_command(out: IO[str], name: str, sig) -> None:
 
 
 def _emit_scalar_or_funcpointer(out: IO[str], name: str) -> None:
-    """ctypes scalars and function-pointer typedefs get a permissive alias."""
-    out.write(f'{name}: Any\n')
+    """ctypes scalars and function-pointer typedefs get a permissive alias.
+
+    ``TypeAlias``, not a bare ``: Any``, because these names are used
+    in *annotation* position elsewhere in the same file - a struct
+    field typed ``PFN_vkAllocationFunction``, for one. A plain
+    annotated assignment declares a variable, and a checker reading
+    ``x: PFN_...`` afterwards reports "Variable not allowed in type
+    expression"; the ``TypeAlias`` form says the name is a type and is
+    exactly as permissive.
+    """
+    out.write(f'{name}: TypeAlias = Any\n')
+
+
+def _is_writable(path: str) -> bool:
+    """Whether ``path`` could plausibly be written (best effort).
+
+    The stub is replaced by writing a sibling temp file and renaming
+    over it, so the directory's permissions are what matter, not the
+    file's. Best effort by nature — Windows ACLs and a language server
+    holding the ``.pyi`` open are both invisible here — which is why
+    :func:`sync_stub` still wraps the write itself. This only exists to
+    keep the common, *statically* unwritable case from re-forcing the
+    whole registry on every import.
+    """
+    return os.access(os.path.dirname(os.path.abspath(path)), os.W_OK)
 
 
 def default_stub_path() -> str:
@@ -330,8 +387,10 @@ def default_stub_path() -> str:
 #: (and previously wrong) stub, which would otherwise never be
 #: rewritten — leaving the stub contradicting the runtime on specific
 #: values. Bumped to 2 when parse_int stopped eating hex digits, and
-#: to 3 when enumerants became enum members rather than bare ints.
-_GENERATOR = 3
+#: to 3 when enumerants became enum members rather than bare ints, and
+#: to 4 when the names the header imports stopped being re-declared
+#: and scalar / funcpointer aliases became TypeAlias.
+_GENERATOR = 4
 
 # The provenance stamp is written as its own first line rather than
 # folded into _HEADER, so the template stays free of format braces and
@@ -372,23 +431,6 @@ def read_stub_provenance(path: str) -> tuple[str, int, str] | None:
     return None
 
 
-def stub_is_stale(registry: Any, *, path: str | None = None) -> bool:
-    """Whether ``path``'s stamp disagrees with ``registry``.
-
-    The cheap half of :func:`sync_stub`: it reads one line and forces
-    nothing, so :func:`volkano.get_registry` can call it on every build
-    without paying for the walk that regenerating costs.
-
-    ``False`` for a registry with no provenance — there is nothing to
-    compare against, so there is nothing to call out of date.
-    """
-    provenance = getattr(registry, '_provenance', None)
-    if provenance is None:
-        return False
-    path = path or default_stub_path()
-    return read_stub_provenance(path) != _expected_stamp(provenance)
-
-
 def sync_stub(registry: Any, *, path: str | None = None) -> bool:
     """Regenerate ``path`` if its stamp disagrees with ``registry``.
 
@@ -410,6 +452,14 @@ def sync_stub(registry: Any, *, path: str | None = None) -> bool:
         return False
     # Log before, not after: this forces every key in the registry and
     # is the multi-second pause a user notices on a cold install.
+    if not _is_writable(path):
+        # Checked before the walk, not after: the walk is the expensive
+        # part, and on a read-only prefix it would be paid on every
+        # import for a write that cannot land.
+        logger.info('%s is out of date but not writable; run '
+                    '`python -m volkano update` somewhere it can be '
+                    'written', path)
+        return False
     logger.info('regenerating %s from %s', path, provenance.uri)
     try:
         count = write_stub(path, registry=registry, provenance=provenance)
@@ -458,6 +508,10 @@ def write_stub(path: str | None = None, *, registry: Any = None,
     skipped: list[str] = []
     for key in sorted(registry):
         if key.startswith('_'):
+            continue
+        if key in _HEADER_NAMES:
+            # Declared already by the header's imports, and better than
+            # we could here — see :func:`_header_bound_names`.
             continue
         try:
             value = registry(key)

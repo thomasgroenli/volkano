@@ -1,12 +1,15 @@
 """Tests for the volkano package facade.
 
 The facade is mode 2 (:func:`volkano.registry`) applied to environment
-variables, plus a module global and a stub *check*. These tests pin
-that relationship: the environment reaches the registry *as arguments*,
-nothing else in the package consults it, and importing never writes.
+variables, plus a module global and a stub sync. These tests pin that
+relationship: the environment reaches the registry *as arguments*,
+nothing else in the package consults it, and the build that follows
+brings the stub level with what it built.
 """
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 import xml.etree.ElementTree as ET
 from unittest.mock import patch
@@ -79,41 +82,74 @@ class FacadeTests(unittest.TestCase):
             b = vk.get_registry()
         self.assertIs(a, b)
 
-    def test_import_never_writes_the_stub(self):
-        # Generating it forces every entry and writes a megabyte into
-        # the installed package; `python -m volkano update` owns that.
-        with _patch_build(lambda *a, **kw: _FakeReg()):
-            with patch.object(stub, 'sync_stub',
-                              side_effect=AssertionError('must not sync')):
-                with patch.object(stub, 'write_stub',
-                                  side_effect=AssertionError('must not write')):
-                    vk.VK_FOO
-                    vk.VK_FOO
+    def test_the_build_syncs_the_stub_once(self):
+        seen = []
 
-    def test_a_stale_stub_is_reported_once_and_names_the_command(self):
-        seen = {}
-
-        def fake_stale(registry, **kw):
-            # Checked after publishing, so a re-entrant attribute access
+        def fake_sync(registry, **kw):
+            # Synced after publishing, so a re-entrant attribute access
             # from anything it touches finds the singleton rather than
             # starting a second build.
-            seen['published'] = vk._registry is registry
+            seen.append(vk._registry is registry)
             return True
 
         with _patch_build(lambda *a, **kw: _FakeReg()):
-            with patch.object(stub, 'stub_is_stale', fake_stale):
-                with self.assertLogs('volkano', level='INFO') as logs:
-                    vk.VK_FOO
-                    vk.VK_FOO
-        self.assertTrue(seen['published'])
-        self.assertEqual(len(logs.records), 1)
-        self.assertIn('python -m volkano update', logs.output[0])
+            with patch.object(stub, 'sync_stub', fake_sync):
+                vk.VK_FOO
+                vk.VK_FOO
+        self.assertEqual(seen, [True])
 
-    def test_a_broken_stub_check_never_sinks_the_import(self):
+    def test_a_broken_stub_sync_never_sinks_the_import(self):
         with _patch_build(lambda *a, **kw: _FakeReg()):
-            with patch.object(stub, 'stub_is_stale',
+            with patch.object(stub, 'sync_stub',
                               side_effect=OSError('read-only')):
                 self.assertEqual(vk.VK_FOO, 42)
+
+    def test_racing_threads_share_one_registry(self):
+        # Two registries mean two ctypes classes per Vulkan type, and
+        # an 'expected VkInstance instance, got VkInstance' the first
+        # time one crosses into the other.
+        builds = []
+
+        def slow_build(*a, **kw):
+            builds.append(1)
+            time.sleep(0.02)        # widen the window a real race needs
+            return _FakeReg()
+
+        seen = []
+        barrier = threading.Barrier(8)
+
+        def worker():
+            barrier.wait()
+            seen.append(vk.get_registry())
+
+        with _patch_build(slow_build):
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(len({id(r) for r in seen}), 1)
+
+    def test_a_re_entrant_access_from_the_stub_sync_does_not_deadlock(self):
+        # sync_stub walks the registry, and anything it touches may
+        # reach back through volkano.<attr>. Run it off-thread so a
+        # regression fails the test instead of hanging the suite.
+        def reentrant_sync(registry, **kw):
+            return vk.VK_FOO == 42
+
+        done = threading.Event()
+
+        def run():
+            vk.VK_FOO
+            done.set()
+
+        with _patch_build(lambda *a, **kw: _FakeReg()):
+            with patch.object(stub, 'sync_stub', reentrant_sync):
+                t = threading.Thread(target=run, daemon=True)
+                t.start()
+                t.join(timeout=10)
+        self.assertTrue(done.is_set(), 'get_registry deadlocked')
 
 
 class EnvironmentTests(unittest.TestCase):

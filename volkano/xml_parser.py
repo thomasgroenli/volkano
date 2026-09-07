@@ -41,10 +41,62 @@ logger = logging.getLogger('volkano.parser')
 # Type-fragment → thunk graph
 # ---------------------------------------------------------------------------
 
+#: Registry keys for the two slots with no name a user would ever type:
+#: C ``void`` (the absence of a type) and volkano's own ``void *`` slot,
+#: which is not a C spelling at all. Underscore-prefixed so the thunk
+#: graph can still resolve them while attribute access, ``dir()`` and
+#: the stub leave them alone.
+VOID = '_void'
+VOID_P = '_void_p'
+
+
 def _bracket_array_length(name_tail: str) -> str | None:
     """Extract ``[N]`` from the text trailing a ``<name>`` element."""
     m = re.search(r'\[([^\]]+)\]', name_tail or '')
     return m.group(1).strip() if m else None
+
+
+#: The C spellings vk.xml writes, mapped to the name volkano publishes
+#: each type under. Applied wherever a type is *named* — which is
+#: :func:`type_form` and the ``alias=`` passthrough, and nowhere else —
+#: so a member declared ``uint32_t`` resolves the very entry a reader
+#: reaches for as ``vk.uint32``. One type, one name, rather than a
+#: registry key per spelling the XML happens to use.
+#:
+#: Several spellings share a target (``bool`` and ``_Bool``; ``intptr_t``
+#: and ``ptrdiff_t``), which is the point: the collapsing happens here,
+#: where it is a table anyone can read, instead of surfacing as five
+#: registry entries for one class.
+#:
+#: Strings on both sides, deliberately. The parser must not import
+#: :mod:`volkano.vulkan_stdlib` — that module imports *this* one — and a
+#: spelling map is the parser's business anyway.
+CANONICAL_TYPE_NAMES: dict[str, str] = {
+    'char':      'char',            # identity, and kept so on purpose
+    'int':       'int32',
+    'float':     'float32',
+    'double':    'float64',
+    'size_t':    'size',
+    'int8_t':    'int8',
+    'int16_t':   'int16',
+    'int32_t':   'int32',
+    'int64_t':   'int64',
+    'uint8_t':   'uint8',
+    'uint16_t':  'uint16',
+    'uint32_t':  'uint32',
+    'uint64_t':  'uint64',
+    'bool':      'uint8',
+    '_Bool':     'uint8',
+    'intptr_t':  'int64',           # 64-bit on the targets we support
+    'uintptr_t': 'uint64',
+    'ptrdiff_t': 'int64',
+    'void':      VOID,
+}
+
+
+def canonical(type_name: str) -> str:
+    """The registry key a C type name resolves through."""
+    return CANONICAL_TYPE_NAMES.get(type_name, type_name)
 
 
 def type_form(elem: ET.Element) -> Any:
@@ -61,7 +113,7 @@ def type_form(elem: ET.Element) -> Any:
     type_elem = elem.find('type')
     name_elem = elem.find('name')
     if type_elem is None or type_elem.text is None:
-        return Force('void_p')
+        return Force(VOID_P)
 
     type_name = type_elem.text.strip()
     pre_text = (elem.text or '')
@@ -82,10 +134,10 @@ def type_form(elem: ET.Element) -> Any:
                 array_len = bracket
 
     if type_name == 'void' and ptr_count >= 1:
-        form = Force('void_p')
+        form = Force(VOID_P)
         ptr_count -= 1
     else:
-        form = Force(type_name)
+        form = Force(canonical(type_name))
 
     for _ in range(ptr_count):
         form = Call('ref', [form])
@@ -389,7 +441,7 @@ class XmlReader:
                 continue
             alias = elem.get('alias')
             if alias is not None:
-                self.output[name] = Force(alias)
+                self.output[name] = Force(canonical(alias))
                 continue
 
             if category == 'basetype':
