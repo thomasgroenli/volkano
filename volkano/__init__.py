@@ -82,7 +82,7 @@ from typing import Any
 #: reads it from here (``dynamic = ["version"]``), so the distribution
 #: metadata, ``volkano.__version__`` and the User-Agent the fetcher
 #: sends cannot drift apart the way a second copy would.
-__version__ = '0.0.1'
+__version__ = '0.1.0'
 
 
 _logger = _logging.getLogger('volkano')
